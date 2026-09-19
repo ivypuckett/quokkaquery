@@ -476,7 +476,10 @@ quokka audit query "SELECT actor_id, count(*), sum(data_scanned_bytes)/1e12 * 5 
 quokka query --connection @audit "SELECT * FROM query_log WHERE status='denied'"
 ```
 
-**Hygiene.** Configurable retention; regex-based secret scrubbing before every write,
+**Hygiene.** The log is kept indefinitely for now — with `fingerprint` as the default
+mode the file grows slowly, and a complete history is what makes review worth doing.
+Retention policies arrive in a later version (M7) rather than as a premature default.
+Regex-based secret scrubbing runs before every write,
 independent of `sql_logging`, so a password pasted into a query never lands even at `full`.
 Credentials never enter the log — they live in the OS keyring via `keyring` 4.x, with an
 encrypted file fallback for headless Linux.
@@ -525,8 +528,61 @@ Every statement is parsed with `sqlparser` before execution:
 - optional schema/table allowlists per connection;
 - every denial is audited with the SQL that triggered it.
 
+**The mode binds both surfaces identically.** A connection's `read_only` / `read_write`
+mode governs the UI exactly as it governs an agent. Exempting the human would turn "one
+execute path" from a structural property into a per-surface policy, and a guarantee with
+an exception is not one.
+
+The cost is real and worth naming: you will hit your own guardrail while sitting at a
+database client, which is precisely the friction people uninstall over. So the UI earns
+its keep by making the mode impossible to be surprised by (§7) rather than by being
+exempt from it, and switching a connection to `read_write` is ordinary human-only
+configuration — not a privilege escalation flow.
+
 This layer matters more than any driver. An agent with a raw `psql` shell is a liability;
 an agent with a classified, capped, logged query tool is a teammate.
+
+### 6.4 Cost guard
+
+Athena bills by data scanned, so a runaway query is a bill rather than an error. Two
+layers, because neither is sufficient alone:
+
+1. **Per-query, server-side.** Athena workgroups support `BytesScannedCutoffPerQuery`,
+   which aborts a single query mid-flight once it exceeds a limit. This is the only
+   control that can stop the query currently running, so a workgroup carrying one is part
+   of the recommended Athena setup rather than an afterthought.
+2. **Cumulative, ours.** A per-actor budget over a rolling window, checked before
+   execution and enforced by denying the query — logged as `status='denied'` like any
+   other refusal, with a message stating the budget, the window, and what has been spent.
+
+**Separate caps for agents and humans**, because the failure modes differ. A person
+running an expensive query is awake, watching it, and will notice the bill; an agent
+looping on a bad query at 3am is the scenario that actually generates a surprise invoice.
+Proposed defaults: agents capped conservatively out of the box, humans uncapped with a
+warning threshold, both per-connection and tunable.
+
+```toml
+[connections.prod.cost_guard]
+window       = "1d"
+agent_limit  = "50GB"     # denies past this
+human_limit  = "unlimited"
+human_warn   = "500GB"
+```
+
+The accounting needs no new storage: `data_scanned_bytes` and `actor_kind` are already
+columns in the audit log, so a budget check is a query against `@audit`. The audit trail
+stops being only a record and becomes load-bearing — which is a good argument for keeping
+it correct.
+
+**What this cannot do, stated plainly.** Athena reports bytes scanned *after* execution,
+and no reliable pre-execution estimate exists. Our budget therefore stops the query
+*after* the one that crossed the line, not the one that crossed it. Layer 1 is what
+bounds a single catastrophic query; layer 2 bounds the drift. Promising a hard
+pre-execution cost cap would be a lie.
+
+The mechanism is generic — a per-actor budget over an audited metric — so it extends to
+row or query counts on other drivers. It is Athena-first because Athena is where a query
+costs money.
 
 ---
 
@@ -546,6 +602,15 @@ result grid bottom-right, audit view as a sibling tab.
   [Export all]". The count comes from the spool, so it is exact rather than estimated, and
   the export button is always the next thing your eye lands on. The cap should read as a
   deliberate choice, not a limit we hit.
+- **Mode indicator** — the connection's read-only / read-write state is visible in the
+  connection tree and persistently in the editor chrome, not buried in settings. A write
+  attempted against a read-only connection fails inline, naming the setting and where to
+  change it. Since the guardrail binds humans too (§6.3), being surprised by it is the
+  failure to design out.
+- **Write confirmation** — on a `read_write` connection, DML and DDL confirm before
+  running, naming the statement kind and target table, and flagging an `UPDATE` or
+  `DELETE` with no `WHERE` clause specifically. The classifier already knows all of this;
+  surfacing it costs nothing and catches the classic disaster.
 - **Async** — driver work runs on tokio; iced `Task`s deliver results as messages. Long
   queries show elapsed time and a cancel button wired to `Driver::cancel`.
 - **Rendering** — `wgpu` by default, `tiny-skia` fallback selectable for remote desktops
@@ -609,9 +674,9 @@ macOS runners produce ad-hoc-signed binaries automatically.
 | M2 | `quokka-spool`, paging, export formats, `quokka export` | The bounded-view contract, proven on the CLI first |
 | M3 | `quokka-policy`, read-only defaults, `quokka mcp` | Safe for agents — the actual differentiator |
 | M4 | `quokka-ui`: iced window, editor, 512-row grid, audit tab | The human UI |
-| M5 | Athena driver, SSO, cost fields in the audit log | Full connector set |
+| M5 | Athena driver, SSO, cost fields in the audit log, cost guard (§6.4) | Full connector set |
 | M6 | `cargo-dist`, Homebrew tap, Scoop/WinGet, docs site | Installable by strangers |
-| M7 | `redacted` SQL logging mode, saved queries, in-process SSO device flow, opt-in result diffing | Quality of life |
+| M7 | `redacted` SQL logging mode, audit retention policies, saved queries, in-process SSO device flow, opt-in result diffing | Quality of life |
 
 The spool lands at M2, before both the policy engine and the UI, because paging and export
 are core semantics rather than UI decoration — the CLI needs them just as much, and
@@ -634,6 +699,9 @@ and Azure Data Studio do not, and it should be real before any pixels are pushed
 | 512 by rows or by cells | **Rows** | A predictable ceiling beats an optimal one; wide tables get scrolling and column hiding. Revisit only if real wide-table use hurts |
 | Result diffing | Explicit action only | A diff needs a second run, and a second run costs money (§1.4) |
 | Logging full SQL text | **Opt-in per connection**, `fingerprint` by default | Literals are PII. The fingerprint still shows which tables were touched, so the safe default stays useful (§5.1) |
+| Athena cost guard | **Yes, with separate agent and human caps** | A person running an expensive query is watching it; an agent looping at 3am is not (§6.4) |
+| Read-only default in the UI | **Binds both surfaces identically** | An exception would make "one execute path" a per-surface policy rather than a property. The UI earns it back by making the mode unmissable |
+| Audit retention | **Keep everything, for now** | `fingerprint` keeps the file small and complete history makes review worthwhile. Policies land at M7 |
 
 The single-user decision is load-bearing in more places than it looks: it removes the
 shared Postgres sink, accounts, and any notion of non-repudiation between people, and it
@@ -641,17 +709,6 @@ re-points the hash chain at its real threat model — an agent editing its own t
 
 ### 11.2 Still open
 
-1. **A cost guard for Athena.** A per-session or per-day `data_scanned_bytes` budget that
-   denies queries past a threshold, logged as a denial like any other. It follows directly
-   from "every query could cost our users", but it is an addition rather than a
-   consequence, so it needs a deliberate yes. Open sub-question: does an agent get a
-   smaller budget than the human?
-2. **Does the read-only default apply to the UI, or only to agents?** A person sitting at
-   a database client reasonably expects to run an `UPDATE`. Proposed: the per-connection
-   mode governs both surfaces identically, and the UI displays the current mode
-   prominently — but that does mean a human hits the guardrail too.
-3. **Audit log retention.** Forever is the simplest and the most useful for review; it is
-   also an ever-growing file of query text on a machine whose owner cares about PII. A
-   default window (90 days?) with explicit opt-out is the likely answer.
-4. **Spool type fidelity.** SQLite's five storage classes versus an Arrow IPC spool (§4.2).
-   Deferred until a real type round-trips badly.
+1. **Spool type fidelity.** SQLite's five storage classes versus an Arrow IPC spool (§4.2).
+   Deliberately deferred until a real type round-trips badly — the evidence should drive
+   this rather than taste.
