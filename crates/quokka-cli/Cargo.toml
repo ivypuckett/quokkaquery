@@ -1,0 +1,37 @@
+[package]
+name = "quokkaquery"
+description = "A single-user database client for agents and humans, with one append-only audit log of every query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "quokka"
+path = "src/main.rs"
+
+[features]
+# `quokka-ui` arrives at M4 behind a default-on `ui` feature. Until then the default
+# build is already the headless one, so `--no-default-features` yields a working CLI.
+default = []
+
+[dependencies]
+quokka-audit.workspace = true
+quokka-core.workspace = true
+quokka-driver = { workspace = true, features = ["sqlite"] }
+
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
