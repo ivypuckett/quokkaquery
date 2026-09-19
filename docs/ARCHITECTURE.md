@@ -349,15 +349,15 @@ code. Starting with SQLite reuses a dependency we already have and gets sorting 
 SQLite (WAL) at the XDG data dir, e.g. `~/.local/share/quokkaquery/audit.db`.
 
 ```sql
-CREATE TABLE query_log (
-  id                TEXT PRIMARY KEY,   -- UUIDv7: sorts by time
-  parent_id         TEXT,               -- retries, follow-ups, exports of a result
-  started_at        TEXT NOT NULL,
-  finished_at       TEXT,
-  duration_ms       INTEGER,
+CREATE TABLE audit_log (
+  id                TEXT PRIMARY KEY,   -- event id, UUIDv7: sorts by time
+  query_id          TEXT NOT NULL,      -- groups the events of one query
+  parent_id         TEXT,               -- retries, re-runs, exports of an earlier query
+  at                TEXT NOT NULL,      -- when this event was appended
+  duration_ms       INTEGER,            -- query_finished only
 
   actor_kind        TEXT NOT NULL,      -- human | agent | automation
-  actor_id          TEXT NOT NULL,      -- OS user, or agent name via --actor / QQ_ACTOR
+  actor_id          TEXT NOT NULL,      -- OS user, or agent name via --actor / QUOKKA_ACTOR
   session_id        TEXT NOT NULL,
   client            TEXT NOT NULL,      -- cli | ui | mcp
 
@@ -366,7 +366,8 @@ CREATE TABLE query_log (
   database          TEXT,
   schema_name       TEXT,
 
-  event_kind        TEXT NOT NULL,      -- query | export | connect | auth
+  event_kind        TEXT NOT NULL,      -- query_started | query_finished
+                                        -- | export | connect | auth | scrub
   sql_logging       TEXT NOT NULL,      -- fingerprint | redacted | full  (§5.1)
   sql_text          TEXT,               -- present only when sql_logging <> 'fingerprint'
   sql_fingerprint   TEXT NOT NULL,      -- normalized via sqlparser; always recorded
@@ -449,6 +450,20 @@ visible and explained rather than silent.
 an audit trail exists to record, so an export is a logged event in its own right, linked
 to the query that produced it via `parent_id`.
 
+**Two events per query, never one mutable row.** A row cannot record both "started at"
+and "finished at" in an append-only table — writing the outcome would mean updating the
+row, which the triggers below forbid. So `query_started` is appended *before* execution
+and `query_finished` after, sharing a `query_id`. This is strictly better for the threat
+model: a start with no finish is visible as exactly that, so killing the process mid-query
+no longer erases the attempt. Reconstructing a query's full story is a join on `query_id`,
+and the `@audit` connection ships a `queries` view that does it for you.
+
+**Fail closed.** If the `query_started` event cannot be written, the query does not run.
+An audit-first tool that executes when it cannot record is not audit-first. If the
+`query_finished` event fails to write, the query has already run, so the failure is
+surfaced loudly rather than swallowed — and the dangling start is the honest record of
+what happened.
+
 **Append-only.** `BEFORE UPDATE` and `BEFORE DELETE` triggers `RAISE(ABORT)`. Each row's
 `row_hash` covers its own fields plus `prev_hash`, so any excision or edit breaks the chain
 and `quokka audit verify` detects it.
@@ -471,9 +486,10 @@ wrappers over the same SQL. Dogfooding the product is the feature.
 ```bash
 quokka audit tail -f --actor claude
 quokka audit query "SELECT actor_id, count(*), sum(data_scanned_bytes)/1e12 * 5 AS usd
-                FROM query_log WHERE started_at > date('now','-7 days')
+                FROM audit_log WHERE event_kind = 'query_finished'
+                  AND at > date('now','-7 days')
                 GROUP BY 1 ORDER BY 3 DESC"
-quokka query --connection @audit "SELECT * FROM query_log WHERE status='denied'"
+quokka query --connection @audit "SELECT * FROM audit_log WHERE status='denied'"
 ```
 
 **Hygiene.** The log is kept indefinitely for now — with `fingerprint` as the default
