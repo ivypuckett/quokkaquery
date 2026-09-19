@@ -367,11 +367,12 @@ CREATE TABLE query_log (
   schema_name       TEXT,
 
   event_kind        TEXT NOT NULL,      -- query | export | connect | auth
-  sql_text          TEXT,
-  sql_fingerprint   TEXT,               -- normalized via sqlparser, for grouping
+  sql_logging       TEXT NOT NULL,      -- fingerprint | redacted | full  (§5.1)
+  sql_text          TEXT,               -- present only when sql_logging <> 'fingerprint'
+  sql_fingerprint   TEXT NOT NULL,      -- normalized via sqlparser; always recorded
   statement_kind    TEXT,               -- select | insert | update | delete | ddl | ...
   read_only         INTEGER,
-  params            TEXT,               -- JSON, redacted
+  params            TEXT,               -- JSON; bound values follow sql_logging
 
   status            TEXT NOT NULL,      -- ok | error | cancelled | denied | timeout
   error_code        TEXT,
@@ -400,12 +401,49 @@ CREATE TABLE query_log (
 that a query ran, by whom, against what, and how it went — never what came back. Result
 data exists only in the ephemeral spool (§4.1) and in files the user explicitly exported.
 
-The remaining PII surface is `sql_text` itself: `WHERE email = 'a@b.example'` puts a
-literal in the query. Two mitigations, both already in the schema's spirit: regex scrubbing
-runs before every write, and a per-connection `log_sql = fingerprint_only` stores the
-normalized shape and discards literals. The default keeps full SQL text, because for a
-single-user tool whose main job is reviewing what an agent did, the literal is usually the
-point — but a connection pointed at personal data should be switched.
+The remaining PII surface is the query text itself: `WHERE email = 'a@b.example'` puts a
+literal in the SQL. So full text is **opt-in per connection**, never the default.
+
+`sql_logging` is a per-connection setting with three values:
+
+| Mode | Stores | Status |
+| --- | --- | --- |
+| `fingerprint` | Normalized shape, literals replaced by `?` | **Default** |
+| `full` | The query verbatim, literals included | Opt-in, chosen per connection |
+| `redacted` | The query as written, with only literal values masked | Later version |
+
+`fingerprint` and `redacted` differ more than they look. A fingerprint is normalized for
+grouping — whitespace collapsed, literals to `?` — which is fine for a one-liner and hard
+to read for a 200-line CTE. `redacted` keeps the query you actually wrote, comments and
+formatting intact, masking values only. It needs an AST round-trip through `sqlparser`
+rather than a normalization pass, which is why it lands later rather than at M0.
+
+Three rules make this work:
+
+1. **The mode is recorded on every row.** Without `sql_logging` in the row, a query with no
+   literals is indistinguishable from one whose literals were dropped — and an audit trail
+   you cannot interpret is not one. Bound `params` follow the same setting, since a bound
+   value is a literal that took a different road.
+2. **The fingerprint is always stored, in every mode.** This is what keeps privacy-first
+   from gutting the product: normalization replaces literals, not identifiers, so *which
+   tables an agent touched, when, how often, and with what kind of statement* survives at
+   the safest setting. What you lose at `fingerprint` is which **records** were reached —
+   so an exfiltration review gets coarser, and a connection you would want that detail for
+   is exactly the one to set to `full`.
+3. **Only a human changes it.** Logging verbosity is human-only configuration. An agent
+   that can lower the fidelity of its own audit trail defeats the threat model this log
+   exists for.
+
+New connections ask once, at creation, rather than inheriting a silent default — the
+choice is too consequential to bury in a config file, and §5's hash chain makes it
+effectively forward-only.
+
+**Changing your mind, in either direction.** Literals dropped at write time are gone; a
+switch to `full` applies to future queries only. The reverse is also constrained: rewriting
+past rows to remove literals breaks the hash chain. `quokka audit scrub --before <date>`
+therefore masks literals in older rows, re-seals the chain from that point, and records the
+scrub as an event in the log itself — so verification still passes and the discontinuity is
+visible and explained rather than silent.
 
 **Exports are audited events.** Someone writing ten million rows to a file is exactly what
 an audit trail exists to record, so an export is a logged event in its own right, linked
@@ -438,10 +476,10 @@ quokka audit query "SELECT actor_id, count(*), sum(data_scanned_bytes)/1e12 * 5 
 quokka query --connection @audit "SELECT * FROM query_log WHERE status='denied'"
 ```
 
-**Hygiene.** Configurable retention; regex-based secret scrubbing before write; opt-out of
-storing full SQL text for sensitive connections (fingerprint only). Credentials never
-enter the log — they live in the OS keyring via `keyring` 4.x, with an encrypted file
-fallback for headless Linux.
+**Hygiene.** Configurable retention; regex-based secret scrubbing before every write,
+independent of `sql_logging`, so a password pasted into a query never lands even at `full`.
+Credentials never enter the log — they live in the OS keyring via `keyring` 4.x, with an
+encrypted file fallback for headless Linux.
 
 ---
 
@@ -573,7 +611,7 @@ macOS runners produce ad-hoc-signed binaries automatically.
 | M4 | `quokka-ui`: iced window, editor, 512-row grid, audit tab | The human UI |
 | M5 | Athena driver, SSO, cost fields in the audit log | Full connector set |
 | M6 | `cargo-dist`, Homebrew tap, Scoop/WinGet, docs site | Installable by strangers |
-| M7 | Saved queries, in-process SSO device flow, opt-in result diffing | Quality of life |
+| M7 | `redacted` SQL logging mode, saved queries, in-process SSO device flow, opt-in result diffing | Quality of life |
 
 The spool lands at M2, before both the policy engine and the UI, because paging and export
 are core semantics rather than UI decoration — the CLI needs them just as much, and
@@ -595,6 +633,7 @@ and Azure Data Studio do not, and it should be real before any pixels are pushed
 | Multi-user / shared audit sink | **Out of scope** | One person and their agents on one machine. No server, no accounts, no shared state |
 | 512 by rows or by cells | **Rows** | A predictable ceiling beats an optimal one; wide tables get scrolling and column hiding. Revisit only if real wide-table use hurts |
 | Result diffing | Explicit action only | A diff needs a second run, and a second run costs money (§1.4) |
+| Logging full SQL text | **Opt-in per connection**, `fingerprint` by default | Literals are PII. The fingerprint still shows which tables were touched, so the safe default stays useful (§5.1) |
 
 The single-user decision is load-bearing in more places than it looks: it removes the
 shared Postgres sink, accounts, and any notion of non-repudiation between people, and it
