@@ -18,6 +18,8 @@ installable with `cargo install`.
 | Distributable without a notarized app bundle | Ship a plain binary, never a browser-downloaded `.app`/`.dmg` |
 | Distributable via Cargo | Pure Rust, no JS toolchain, no system webview |
 | **Promise only what we're good at** | A bounded, excellent result viewer plus first-class export — not a spreadsheet |
+| **No query runs without consent** | Queries cost money and touch production; nothing executes implicitly (§1.4) |
+| Single user, local only | One person and their agents on one machine. No server, no shared state, no accounts |
 
 ### 1.1 macOS quarantine follows the distribution channel, not the toolkit
 
@@ -61,7 +63,7 @@ What we give up, stated honestly:
 
 - **Remote and headless use.** A native window does not work over an SSH port-forward or
   in a devcontainer. Mitigation: the CLI is the first-class remote interface, and stays
-  fully featured. A `qq ui --serve` web mode remains possible later behind the same core.
+  fully featured. A `quokka ui --serve` web mode remains possible later behind the same core.
 - **Accessibility.** iced's AccessKit integration is partial; screen reader support is
   well behind the browser. Mitigation: design keyboard-first, document the gap plainly.
 - **Widget maturity.** Which §1.3 turns from a cost into a constraint.
@@ -85,27 +87,51 @@ The UI promises a bounded set of things and does them well:
 The README should say this in the first paragraph. Being narrow and honest about it is a
 feature of the product, not an apology for it.
 
+### 1.4 No query runs without consent
+
+Every query may cost money — Athena bills by data scanned — and every query touches
+production. So the tool never issues one the user did not ask for:
+
+- No auto-refresh, no background polling, no periodic re-runs of an open result.
+- No speculative prefetch. Paging reads the spool, which is already paid for, and never
+  reaches the database.
+- Autocomplete reads the cached catalog; it never queries to fill a suggestion. Refreshing
+  the catalog is an explicit action.
+- A stale result tab offers a re-run control. It does not re-run itself.
+- `quokka export --query-id <id>` requires an explicit `--rerun`, because the spool is
+  gone and producing the file means paying for the scan a second time. Without the flag it
+  errors and explains why.
+- Result diffing, if built, is an explicit action on an explicit second run — never an
+  automatic refresh behind a diff view.
+
+This binds the agent surfaces too: the MCP server exposes no tool that re-executes
+implicitly, and a cost-bearing re-run is always a distinct, audited call.
+
 ---
 
 ## 2. Workspace layout
 
+The published package is `quokkaquery`; the binary it installs is `quokka`. (The bare
+`quokka` name on crates.io belongs to an unrelated crate, which constrains the package
+name only, not the binary.)
+
 ```
 crates/
-  qq-core      Value/Row types, connection registry, config, secret redaction
-  qq-driver    `trait Driver` + sqlite / postgres / mysql / athena implementations
-  qq-spool     result cache: one execution -> paging, sorting, export (§4)
-  qq-audit     append-only SQLite log: schema, hash chain, search API
-  qq-policy    sqlparser-based statement classification and guardrails
-  qq-cli       clap CLI — the human and agent entry point (bin: `qq`)
-  qq-mcp       stdio MCP server (rmcp) for agent clients
-  qq-ui        iced application (feature-gated, default on)
+  quokka-core     Value/Row types, connection registry, config, secret redaction
+  quokka-driver   `trait Driver` + sqlite / postgres / mysql / athena impls
+  quokka-spool    result cache: one execution -> paging, sorting, export (§4)
+  quokka-audit    append-only SQLite log: schema, hash chain, search API
+  quokka-policy   sqlparser-based statement classification and guardrails
+  quokka-cli      clap CLI — the human and agent entry point (bin: `quokka`)
+  quokka-mcp      stdio MCP server (rmcp) for agent clients
+  quokka-ui       iced application (feature-gated, default on)
 ```
 
-There is no HTTP server crate. Every surface calls `qq-core::execute()`, which consults
-`qq-policy`, dispatches to a `Driver`, spools the result, and writes to `qq-audit`. There
-is no way to run SQL that skips it.
+There is no HTTP server crate. Every surface calls `quokka-core::execute()`, which
+consults `quokka-policy`, dispatches to a `Driver`, spools the result, and writes to
+`quokka-audit`. There is no way to run SQL that skips it.
 
-`qq-ui` sits behind a default-on `ui` feature. `cargo install quokkaquery
+`quokka-ui` sits behind a default-on `ui` feature. `cargo install quokkaquery
 --no-default-features` yields a lean headless CLI with no `wgpu`/`winit` dependency tree —
 which is what you want in a container, in CI, or on an agent's box.
 
@@ -154,10 +180,10 @@ binary.
 - **Async to the bottom.** JDBC is blocking and libpq's async mode is awkward.
   Cancellation, streaming into the spool, and a responsive UI all depend on this.
 - **It is what makes the audit claim true.** "Every query is logged" holds only if every
-  path to the database runs through `qq-core::execute()`. A user-supplied driver with
-  arbitrary connection properties is a path we do not control. Compiled-in drivers make
-  the guarantee structural rather than aspirational — the driver choice and the product's
-  central promise are the same decision.
+  path to the database runs through `quokka-core::execute()`. A user-supplied driver
+  with arbitrary connection properties is a path we do not control. Compiled-in drivers
+  make the guarantee structural rather than aspirational — the driver choice and the
+  product's central promise are the same decision.
 
 **What we give up, stated plainly:**
 
@@ -234,8 +260,8 @@ that makes the bounded UI honest rather than limiting.
 query re-executes it per page: on Athena you pay for every scan again, on Postgres deep
 offsets degrade badly, and without a total ordering page 2 can repeat rows from page 1.
 
-Instead, **execute once and spool**. As `QueryStream` yields batches, `qq-spool` writes
-them into a per-result SQLite database:
+Instead, **execute once and spool**. As `QueryStream` yields batches, `quokka-spool`
+writes them into a per-result SQLite database:
 
 ```
 result(rowid INTEGER PRIMARY KEY, c0, c1, … cN)   -- rows in arrival order
@@ -271,12 +297,14 @@ spooled at 10:00 and paged at 10:45 is still 45 minutes old. So a result tab alw
 `as of 10:00 (45m ago)` with a re-run control, and flags itself past a configurable
 `spool_stale_after`. Bounded and visible beats invisible.
 
-**Consequence for the CLI.** A `qq` invocation is short-lived, so its spool dies with it
-and cannot be paged or exported by a *later* invocation. Export therefore happens in the
-same invocation (`qq query … --export out.parquet`), and `qq export --query-id <id>`
-**re-runs** the original query, logged as a new event whose `parent_id` points at the
-first. It costs a second scan and says so. Serving cached rows from a previous run would
-be exactly the staleness this section exists to prevent.
+**Consequence for the CLI.** A `quokka` invocation is short-lived, so its spool dies with
+it and cannot be paged or exported by a *later* invocation. Export therefore happens in
+the same invocation (`quokka query … --export out.parquet`). Exporting by id afterwards
+means re-running the original query, which costs a second scan, so per §1.4 it never
+happens implicitly: `quokka export --query-id <id>` errors and explains unless given
+`--rerun`, and the re-run is logged as a new event whose `parent_id` points at the first.
+Serving cached rows from the earlier run instead would be exactly the staleness this
+section exists to prevent.
 
 The MCP server and the UI are long-lived processes, so both page and export from a live
 spool normally.
@@ -292,8 +320,14 @@ spool normally.
 | Export | unbounded | — | Streams driver → file, never buffered |
 
 On hitting the spool cap the result is marked truncated, and the UI says so explicitly
-rather than silently showing a prefix. `qq export --all` bypasses the spool entirely,
+rather than silently showing a prefix. `quokka export --all` bypasses the spool entirely,
 streaming driver → file for datasets larger than local disk.
+
+The ceiling counts **rows, not cells**. A 200-column result at 512 rows is far more spool
+traffic and far less readable than a 3-column one, and a cell budget that silently lowered
+the page size for wide results would make the ceiling unpredictable. Predictable beats
+optimal here; wide tables get horizontal scrolling and column hiding instead. If wide
+results turn out to hurt in practice, a secondary cell budget is the known escape hatch.
 
 **The truncation trap to get right:** sort and filter operate on the *spooled subset*. If
 1M of 12M rows were spooled, sorting yields the top of the first million, not of the
@@ -360,30 +394,48 @@ CREATE TABLE query_log (
 );
 ```
 
+### 5.1 What the audit log never stores
+
+**No result data. Not rows, not samples, not digests or hashes of rows.** The log records
+that a query ran, by whom, against what, and how it went — never what came back. Result
+data exists only in the ephemeral spool (§4.1) and in files the user explicitly exported.
+
+The remaining PII surface is `sql_text` itself: `WHERE email = 'a@b.example'` puts a
+literal in the query. Two mitigations, both already in the schema's spirit: regex scrubbing
+runs before every write, and a per-connection `log_sql = fingerprint_only` stores the
+normalized shape and discards literals. The default keeps full SQL text, because for a
+single-user tool whose main job is reviewing what an agent did, the literal is usually the
+point — but a connection pointed at personal data should be switched.
+
 **Exports are audited events.** Someone writing ten million rows to a file is exactly what
 an audit trail exists to record, so an export is a logged event in its own right, linked
 to the query that produced it via `parent_id`.
 
 **Append-only.** `BEFORE UPDATE` and `BEFORE DELETE` triggers `RAISE(ABORT)`. Each row's
-`row_hash` covers its own fields plus `prev_hash`, so any excision or edit breaks the
-chain and `qq audit verify` detects it. This is tamper-*evidence*, not tamper-proofing —
-anyone with the file can rebuild the chain — and the docs must say so plainly. Teams
-needing more point the optional audit sink at a shared Postgres they don't own.
+`row_hash` covers its own fields plus `prev_hash`, so any excision or edit breaks the chain
+and `quokka audit verify` detects it.
+
+Worth being precise about what that buys a single-user tool. The threat model is not a
+colleague disputing the record — there is no colleague. It is **an agent with shell access
+quietly editing the log of what it just did.** The chain makes that detectable, which is
+the whole reason the audit trail is trustworthy enough to review. It is emphatically not a
+defense against the machine's owner, who can rebuild the chain at will, and the docs must
+say so plainly rather than implying a guarantee that isn't there.
 
 **Denials are logged too.** What an agent *tried* to run and was blocked from running is
 as valuable as the successes.
 
 **Queryable by both surfaces, without a second API.** The audit database registers as a
 built-in connection named `@audit`. Agents query it through the ordinary `query` tool; the
-UI's audit view is a saved query against it; `qq audit …` subcommands are ergonomic
+UI's audit view is a saved query against it; `quokka audit …` subcommands are ergonomic
 wrappers over the same SQL. Dogfooding the product is the feature.
 
 ```bash
-qq audit tail -f --actor claude
-qq audit query "SELECT actor_id, count(*), sum(data_scanned_bytes)/1e12 * 5 AS usd
+quokka audit tail -f --actor claude
+quokka audit query "SELECT actor_id, count(*), sum(data_scanned_bytes)/1e12 * 5 AS usd
                 FROM query_log WHERE started_at > date('now','-7 days')
                 GROUP BY 1 ORDER BY 3 DESC"
-qq query --connection @audit "SELECT * FROM query_log WHERE status='denied'"
+quokka query --connection @audit "SELECT * FROM query_log WHERE status='denied'"
 ```
 
 **Hygiene.** Configurable retention; regex-based secret scrubbing before write; opt-out of
@@ -401,16 +453,16 @@ Stable, machine-first output. `--format json` for a single envelope, `--format n
 streaming large results, errors as JSON on stderr with meaningful exit codes.
 
 ```bash
-qq connections list --format json
-qq schema describe orders --connection prod --format json
-qq query --connection prod --max-rows 1000 --timeout 30s -f ./q.sql --format ndjson
-qq query --connection prod -f ./q.sql --export ./orders.parquet     # one invocation
-qq export --query-id 018f… -o ./orders.parquet                      # re-runs; says so
+quokka connections list --format json
+quokka schema describe orders --connection prod --format json
+quokka query --connection prod --max-rows 1000 --timeout 30s -f ./q.sql --format ndjson
+quokka query --connection prod -f ./q.sql --export ./orders.parquet     # one invocation
+quokka export --query-id 018f… --rerun -o ./orders.parquet          # costs a 2nd scan
 ```
 
 ### 6.2 MCP server
 
-`qq mcp` runs a stdio MCP server (`rmcp` 3.x) exposing `list_connections`, `list_schemas`,
+`quokka mcp` runs a stdio MCP server (`rmcp` 3.x) exposing `list_connections`, `list_schemas`,
 `describe_table`, `query`, `explain`, `export` and `search_audit`. Agent clients attach
 directly — no shelling out, no output parsing, and schema introspection arrives as
 structured context instead of guesswork.
@@ -419,11 +471,11 @@ Tool responses are hard-capped at 512 rows — the same ceiling the grid uses, f
 reason: an unbounded result set dumped into a context window is a failure mode, not a
 feature. Beyond that the agent pages, refines, or exports to a file.
 
-The spool pays off here too. `qq mcp` is a long-lived process, so an agent runs a query
+The spool pays off here too. `quokka mcp` is a long-lived process, so an agent runs a query
 once, gets a bounded preview, and can then page, sort or export from the spool without
 re-scanning the source — and without paying Athena twice.
 
-### 6.3 Guardrails (`qq-policy`)
+### 6.3 Guardrails (`quokka-policy`)
 
 Every statement is parsed with `sqlparser` before execution:
 
@@ -442,7 +494,7 @@ an agent with a classified, capped, logged query tool is a teammate.
 
 ## 7. Human UI (iced)
 
-`qq ui` opens a native window. Layout: connection tree on the left, SQL editor top-right,
+`quokka ui` opens a native window. Layout: connection tree on the left, SQL editor top-right,
 result grid bottom-right, audit view as a sibling tab.
 
 - **Editor** — `iced::widget::text_editor` with `iced_highlighter` (syntect) for SQL
@@ -505,7 +557,7 @@ macOS runners produce ad-hoc-signed binaries automatically.
   out equal, and every export format reproduces the spool exactly. Truncation must be
   reported, never silent.
 - Audit: property test that the hash chain detects every single-row edit or deletion.
-- UI: keep logic in `qq-core` and out of the iced `update`/`view` functions, so the UI
+- UI: keep logic in `quokka-core` and out of the iced `update`/`view` functions, so the UI
   layer is thin enough that its test story is smoke tests and manual passes.
 
 ---
@@ -514,14 +566,14 @@ macOS runners produce ad-hoc-signed binaries automatically.
 
 | # | Scope | Outcome |
 | --- | --- | --- |
-| M0 | Workspace, `Driver` trait, SQLite, audit log, `qq query --format json` | End-to-end skeleton: a query runs and is provably logged |
+| M0 | Workspace, `Driver` trait, SQLite, audit log, `quokka query --format json` | End-to-end skeleton: a query runs and is provably logged |
 | M1 | Postgres + MySQL, connection registry, keyring, introspection | Real daily-driver CLI |
-| M2 | `qq-spool`, paging, export formats, `qq export` | The bounded-view contract, proven on the CLI first |
-| M3 | `qq-policy`, read-only defaults, `qq mcp` | Safe for agents — the actual differentiator |
-| M4 | `qq-ui`: iced window, editor, 512-row grid, audit tab | The human UI |
+| M2 | `quokka-spool`, paging, export formats, `quokka export` | The bounded-view contract, proven on the CLI first |
+| M3 | `quokka-policy`, read-only defaults, `quokka mcp` | Safe for agents — the actual differentiator |
+| M4 | `quokka-ui`: iced window, editor, 512-row grid, audit tab | The human UI |
 | M5 | Athena driver, SSO, cost fields in the audit log | Full connector set |
 | M6 | `cargo-dist`, Homebrew tap, Scoop/WinGet, docs site | Installable by strangers |
-| M7 | Shared Postgres audit sink, saved queries, in-process SSO device flow | Team features |
+| M7 | Saved queries, in-process SSO device flow, opt-in result diffing | Quality of life |
 
 The spool lands at M2, before both the policy engine and the UI, because paging and export
 are core semantics rather than UI decoration — the CLI needs them just as much, and
@@ -532,19 +584,35 @@ and Azure Data Studio do not, and it should be real before any pixels are pushed
 
 ---
 
-## 11. Open questions
+## 11. Decisions and remaining questions
 
-1. Binary name — `qq` is short and pleasant but collides on some systems; `quokka` as the
-   canonical name with `qq` as an alias is the safer default.
-2. Does the audit log store result digests? Useful for reproducibility, a leak vector for
-   sensitive tables. Proposed: off by default, per-connection opt-in.
-3. Multi-user teams: is the shared Postgres sink append-only from clients, or does a small
-   server own it? The latter is the only way to make the chain genuinely non-repudiable,
-   and it is a much larger project.
-4. Does the 512-row ceiling hold by rows or by cells? A 200-column result at 512 rows is
-   far more spool traffic and far less readable than a 3-column one. A secondary cell
-   budget that lowers the effective page size for very wide results may be worth it —
-   deferred until we have seen real wide-table behaviour.
-5. Should a UI re-run diff against the previous result ("3 rows changed since 10:00")?
-   Cheap to do from two spools, genuinely useful when watching a table, and a natural
-   answer to the staleness the ephemeral spool leaves on the table.
+### 11.1 Decided
+
+| Question | Decision | Why |
+| --- | --- | --- |
+| Binary name | `quokka` (package `quokkaquery`) | Readable and unambiguous; the package name is the only thing crates.io constrains |
+| Result digests in the audit log | **Never stored** | Result contents are PII. The log describes queries, not their output (§5.1) |
+| Multi-user / shared audit sink | **Out of scope** | One person and their agents on one machine. No server, no accounts, no shared state |
+| 512 by rows or by cells | **Rows** | A predictable ceiling beats an optimal one; wide tables get scrolling and column hiding. Revisit only if real wide-table use hurts |
+| Result diffing | Explicit action only | A diff needs a second run, and a second run costs money (§1.4) |
+
+The single-user decision is load-bearing in more places than it looks: it removes the
+shared Postgres sink, accounts, and any notion of non-repudiation between people, and it
+re-points the hash chain at its real threat model — an agent editing its own trail.
+
+### 11.2 Still open
+
+1. **A cost guard for Athena.** A per-session or per-day `data_scanned_bytes` budget that
+   denies queries past a threshold, logged as a denial like any other. It follows directly
+   from "every query could cost our users", but it is an addition rather than a
+   consequence, so it needs a deliberate yes. Open sub-question: does an agent get a
+   smaller budget than the human?
+2. **Does the read-only default apply to the UI, or only to agents?** A person sitting at
+   a database client reasonably expects to run an `UPDATE`. Proposed: the per-connection
+   mode governs both surfaces identically, and the UI displays the current mode
+   prominently — but that does mean a human hits the guardrail too.
+3. **Audit log retention.** Forever is the simplest and the most useful for review; it is
+   also an ever-growing file of query text on a machine whose owner cares about PII. A
+   default window (90 days?) with explicit opt-out is the likely answer.
+4. **Spool type fidelity.** SQLite's five storage classes versus an Arrow IPC spool (§4.2).
+   Deferred until a real type round-trips badly.
