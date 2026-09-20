@@ -18,6 +18,12 @@ use uuid::Uuid;
 pub enum EventKind {
     QueryStarted,
     QueryFinished,
+    /// One per catalog refresh, appended after the fact (§5).
+    ///
+    /// Not a query pair: introspection runs the driver's own bounded SQL on a TTL, so
+    /// there is no outcome to hold open and no caller statement to record having
+    /// attempted. Emitted from M1, when introspection exists.
+    Introspect,
     Export,
     Connect,
     Auth,
@@ -29,6 +35,7 @@ impl EventKind {
         match self {
             EventKind::QueryStarted => "query_started",
             EventKind::QueryFinished => "query_finished",
+            EventKind::Introspect => "introspect",
             EventKind::Export => "export",
             EventKind::Connect => "connect",
             EventKind::Auth => "auth",
@@ -40,6 +47,7 @@ impl EventKind {
         Some(match s {
             "query_started" => EventKind::QueryStarted,
             "query_finished" => EventKind::QueryFinished,
+            "introspect" => EventKind::Introspect,
             "export" => EventKind::Export,
             "connect" => EventKind::Connect,
             "auth" => EventKind::Auth,

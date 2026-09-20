@@ -110,10 +110,11 @@ impl Driver for SqliteDriver {
         _permit: &ExecutePermit,
         _scope: Scope,
     ) -> Result<Catalog, DriverError> {
-        // Introspection is an M1 deliverable, and it runs SQL — which means it needs an
-        // audit story of its own before it exists, not after. Until `quokka-core` grows
-        // an audited introspection path, this returns nothing rather than quietly
-        // becoming a second, unlogged route to the database.
+        // Introspection is an M1 deliverable. Its audit story is now settled (§5: one
+        // `introspect` event per catalog refresh, appended after the fact), but the
+        // audited path in `quokka-core` that would emit it does not exist yet. Until it
+        // does, this returns nothing rather than quietly becoming a second, unlogged
+        // route to the database.
         Err(DriverError::Unsupported(
             "schema introspection arrives at M1".to_string(),
         ))

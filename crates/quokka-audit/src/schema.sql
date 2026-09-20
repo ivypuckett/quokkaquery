@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
   schema_name       TEXT,
 
   event_kind        TEXT NOT NULL,      -- query_started | query_finished
-                                        -- | export | connect | auth | scrub
+                                        -- | introspect | export | connect | auth | scrub
   sql_logging       TEXT NOT NULL,      -- fingerprint | redacted | full  (§5.1)
   sql_text          TEXT,               -- present only when sql_logging <> 'fingerprint'
   sql_fingerprint   TEXT NOT NULL,      -- normalized via sqlparser; always recorded

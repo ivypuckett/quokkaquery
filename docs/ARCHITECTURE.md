@@ -367,7 +367,7 @@ CREATE TABLE audit_log (
   schema_name       TEXT,
 
   event_kind        TEXT NOT NULL,      -- query_started | query_finished
-                                        -- | export | connect | auth | scrub
+                                        -- | introspect | export | connect | auth | scrub
   sql_logging       TEXT NOT NULL,      -- fingerprint | redacted | full  (§5.1)
   sql_text          TEXT,               -- present only when sql_logging <> 'fingerprint'
   sql_fingerprint   TEXT NOT NULL,      -- normalized via sqlparser; always recorded
@@ -449,6 +449,27 @@ visible and explained rather than silent.
 **Exports are audited events.** Someone writing ten million rows to a file is exactly what
 an audit trail exists to record, so an export is a logged event in its own right, linked
 to the query that produced it via `parent_id`.
+
+**Introspection is logged, but not as a query.** Catalog reads run SQL, so invariant 1
+binds them: they go through `execute()` like everything else. But they are *our* SQL, not
+the caller's — `Driver::introspect` takes a `Scope`, never a statement, so the text that
+reaches the database is one the driver wrote — and they run on a TTL refresh (§3.1)
+rather than when a person asks. Recording a `query_started`/`query_finished` pair per
+autocomplete refresh would bury the record that review exists to read, and would make
+"which tables did this agent touch" ambiguous between reading a table and describing it.
+
+So a catalog refresh appends **one `introspect` event, after the fact**, naming the scope
+it covered, how long it took and how it went. One event rather than two because there is
+no outcome to hold open: the statement is bounded and ours, so a refresh that dies leaves
+a stale cache rather than a half-written record of something unknown. For the same reason
+fail-closed does not apply — there is no "before" event to fail — and a failed write is
+surfaced loudly rather than swallowed, exactly as a failed `query_finished` is. The
+saving is real: at a one-minute TTL this is the difference between a handful of rows a
+day and thousands.
+
+This holds only while introspection cannot carry caller-supplied SQL. The day a surface
+wants to run its own catalog query, that is a `query_started`/`query_finished` pair like
+any other, because it is one.
 
 **Two events per query, never one mutable row.** A row cannot record both "started at"
 and "finished at" in an append-only table — writing the outcome would mean updating the
@@ -717,6 +738,7 @@ and Azure Data Studio do not, and it should be real before any pixels are pushed
 | Logging full SQL text | **Opt-in per connection**, `fingerprint` by default | Literals are PII. The fingerprint still shows which tables were touched, so the safe default stays useful (§5.1) |
 | Athena cost guard | **Yes, with separate agent and human caps** | A person running an expensive query is watching it; an agent looping at 3am is not (§6.4) |
 | Read-only default in the UI | **Binds both surfaces identically** | An exception would make "one execute path" a per-surface policy rather than a property. The UI earns it back by making the mode unmissable |
+| Logging schema introspection | **One `introspect` event per catalog refresh**, not a query pair | Catalog reads are the driver's own bounded SQL on a TTL, not the caller's. Two events per autocomplete refresh would bury the log review exists to read (§5) |
 | Audit retention | **Keep everything, for now** | `fingerprint` keeps the file small and complete history makes review worthwhile. Policies land at M7 |
 
 The single-user decision is load-bearing in more places than it looks: it removes the
