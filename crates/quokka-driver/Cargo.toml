@@ -12,7 +12,14 @@ authors.workspace = true
 default = ["sqlite"]
 sqlite = ["sqlx/sqlite"]
 postgres = ["sqlx/postgres"]
-mysql = ["sqlx/mysql"]
+# `mysql-rsa` is not optional in practice. MySQL 8 defaults to the
+# `caching_sha2_password` auth plugin, and on a connection with no TLS the client has to
+# fetch the server's RSA public key to encrypt the password — sqlx puts that behind this
+# feature, and without it every MySQL 8 connection over plaintext fails to authenticate.
+# MariaDB still defaults to `mysql_native_password`, which is why this does not show up
+# until a real MySQL 8 is on the other end. The `rsa` crate is RustCrypto: pure Rust,
+# MIT/Apache-2.0, no C and no GPL.
+mysql = ["sqlx/mysql", "sqlx/mysql-rsa"]
 # The container-backed tests of §9, which need Docker and therefore must not run in the
 # default `cargo test`. Cargo does not allow an *optional* dev-dependency, so
 # `testcontainers` is an optional normal dependency instead and the test file that uses

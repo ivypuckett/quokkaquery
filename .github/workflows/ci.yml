@@ -92,13 +92,19 @@ jobs:
       # no wgpu/winit in the tree. Trivially true until `quokka-ui` arrives at M4, which
       # is exactly why the guard belongs here before it does — the commit that breaks
       # this is the one that adds the UI without gating it.
+      # Note the here-strings. Piping into `grep -q` looks equivalent and is not: a
+      # match makes grep exit immediately, `echo` takes SIGPIPE, and `pipefail` then
+      # reports the whole pipeline as failed. For this check that means the guard fails
+      # *open* — a GUI dependency would make grep match, the pipeline "fail", and the
+      # `if` go false, so the error would never be printed. A here-string has no pipe
+      # and no second process to kill.
       - name: no wgpu/winit in the headless tree
         run: |
           set -euo pipefail
           tree=$(cargo tree --package quokkaquery --no-default-features --edges normal)
-          if echo "$tree" | grep -Eiq '\b(wgpu|winit|webkit2gtk|iced)'; then
+          if grep -Eiq '\b(wgpu|winit|webkit2gtk|iced)' <<<"$tree"; then
             echo "::error::a GUI dependency reached the headless build:"
-            echo "$tree" | grep -Ei '\b(wgpu|winit|webkit2gtk|iced)'
+            grep -Ei '\b(wgpu|winit|webkit2gtk|iced)' <<<"$tree"
             exit 1
           fi
           echo "headless tree is clean"
@@ -114,7 +120,7 @@ jobs:
           set -euo pipefail
           tree=$(cargo tree --package quokkaquery --no-default-features --edges normal)
           for driver in sqlite postgres mysql; do
-            if ! echo "$tree" | grep -q "sqlx-$driver"; then
+            if ! grep -q "sqlx-$driver" <<<"$tree"; then
               echo "::error::the headless build dropped the $driver driver"
               exit 1
             fi

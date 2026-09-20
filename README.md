@@ -50,6 +50,16 @@ at M4, and Athena at M5. See `docs/ARCHITECTURE.md` §10.
 
 `libmysqlclient` is never linked: it is GPLv2 and this project is MIT.
 
+**MySQL 8 and `caching_sha2_password`.** That is MySQL 8's default authentication plugin,
+and on a connection with no TLS it requires the client to fetch the server's RSA public
+key and encrypt the password with it. QuokkaQuery enables sqlx's `mysql-rsa` feature so
+this works out of the box — the alternative is a driver that cannot log in to a default
+MySQL 8 unless you turn TLS on. The `rsa` crate it pulls is RustCrypto: pure Rust,
+MIT/Apache-2.0. Note that only the *public-key encryption* half is used here, to send the
+password; if you would rather the key exchange never happened at all, set `tls =
+"require"` on the connection, which is the better answer anyway. MariaDB still defaults
+to `mysql_native_password` and never reaches this path.
+
 The "tested against" column is not a claim, it is the version the container-backed tests
 pin and CI runs on every pull request (`cargo test -p quokka-driver --features
 docker-tests`). Claiming support for a database nobody has run against is the failure
