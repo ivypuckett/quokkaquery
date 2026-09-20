@@ -11,6 +11,13 @@ authors.workspace = true
 [features]
 default = ["sqlite"]
 sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+mysql = ["sqlx/mysql"]
+# The container-backed tests of §9, which need Docker and therefore must not run in the
+# default `cargo test`. Cargo does not allow an *optional* dev-dependency, so
+# `testcontainers` is an optional normal dependency instead and the test file that uses
+# it is `#[cfg]`-gated on this feature. Nothing in the library ever refers to it.
+docker-tests = ["postgres", "mysql", "dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 quokka-core.workspace = true
@@ -20,6 +27,9 @@ futures.workspace = true
 sqlx = { workspace = true, default-features = false, features = ["runtime-tokio"] }
 tokio = { workspace = true }
 uuid.workspace = true
+
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
 quokka-audit.workspace = true
