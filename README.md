@@ -84,6 +84,17 @@ $ cargo build
 $ cargo test
 ```
 
+CLAUDE.md asks for `cargo fmt` and `cargo clippy -- -D warnings` clean before every
+commit. A hook that enforces it is checked in; opt into it once per clone:
+
+```console
+$ git config core.hooksPath .githooks
+```
+
+CI is the authority — it runs fmt, clippy and the tests on Linux, macOS and Windows,
+checks that `--no-default-features` pulls no GUI dependencies, and pins the declared
+`rust-version`. The full release matrix arrives with `cargo-dist` at M6.
+
 `docs/ARCHITECTURE.md` is the source of truth for every decision here, and `CLAUDE.md`
 lists the invariants that must not be eroded.
 

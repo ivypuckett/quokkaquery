@@ -1,0 +1,95 @@
+# The gate CLAUDE.md's conventions describe: fmt, clippy -D warnings and tests clean,
+# with no Docker anywhere. ARCHITECTURE §8's release matrix — musl, cargo-dist,
+# installers — lands at M6; this is only what keeps the tree honest in the meantime.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push supersedes the run in flight for the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a CI failure is worth more than the noise it costs.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # --all-targets so tests and examples are linted too, not just the libraries.
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+  platforms:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # arm64 macOS and Windows alongside the Linux job above. Windows needs the MSVC
+        # build tools for libsqlite3-sys, which the runner image already carries (§8).
+        # x86_64 macOS and musl add nothing a Rust build breaks differently on; they
+        # belong to M6's release matrix, where the artifacts are what is being proved.
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+  headless:
+    name: headless build has no GUI dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --no-default-features
+        run: cargo build --workspace --no-default-features
+
+      # CLAUDE.md: `--no-default-features` must always yield a working headless CLI with
+      # no wgpu/winit in the tree. Trivially true until `quokka-ui` arrives at M4, which
+      # is exactly why the guard belongs here before it does — the commit that breaks
+      # this is the one that adds the UI without gating it.
+      - name: no wgpu/winit in the headless tree
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --package quokkaquery --no-default-features --edges normal)
+          if echo "$tree" | grep -Eiq '\b(wgpu|winit|webkit2gtk|iced)'; then
+            echo "::error::a GUI dependency reached the headless build:"
+            echo "$tree" | grep -Ei '\b(wgpu|winit|webkit2gtk|iced)'
+            exit 1
+          fi
+          echo "headless tree is clean"
+
+      - name: the headless binary runs
+        run: cargo run --package quokkaquery --no-default-features -- --version
+
+  msrv:
+    name: builds on the declared rust-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Keep this in step with `rust-version` in the workspace Cargo.toml. An MSRV
+      # nobody checks quietly stops being true — this one already had.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets --all-features

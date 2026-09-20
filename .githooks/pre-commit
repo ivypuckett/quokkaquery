@@ -1,0 +1,36 @@
+#!/bin/sh
+# CLAUDE.md: `cargo fmt` and `cargo clippy -- -D warnings` clean before every commit.
+# This hook enforces that locally so CI is a confirmation rather than a discovery.
+#
+# Opt in with:   git config core.hooksPath .githooks
+# Skip once:     git commit --no-verify
+#
+# Deliberately no `cargo test` here. Tests take long enough that a hook running them
+# trains people to reach for --no-verify, and CI is the authority on them anyway.
+
+set -eu
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo is not on PATH; skipping the Rust checks" >&2
+    exit 0
+fi
+
+# A docs-only commit has nothing for these to say.
+if ! git diff --cached --name-only --diff-filter=ACMR \
+    | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$'; then
+    exit 0
+fi
+
+fail() {
+    echo >&2
+    echo "pre-commit: $1" >&2
+    echo "            fix it, or commit with --no-verify if you know why." >&2
+    exit 1
+}
+
+echo "pre-commit: cargo fmt --all --check"
+cargo fmt --all --check || fail "formatting is not clean (run: cargo fmt --all)"
+
+echo "pre-commit: cargo clippy --workspace --all-targets --all-features -- -D warnings"
+cargo clippy --workspace --all-targets --all-features -- -D warnings \
+    || fail "clippy found something"
