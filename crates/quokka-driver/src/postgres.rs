@@ -179,10 +179,10 @@ impl Driver for PostgresDriver {
                 .unwrap_or(false);
             if !last {
                 tables.push(TableInfo {
-                    database: scope
-                        .database
-                        .clone()
-                        .or_else(|| current_database(&self.pool)),
+                    // Postgres reports the schema, which is the level that matters
+                    // here; the database is whichever one the connection opened, and
+                    // the catalog query cannot cross it anyway.
+                    database: scope.database.clone(),
                     schema: Some(schema),
                     name,
                     kind: relkind(&kind).to_string(),
@@ -406,12 +406,6 @@ fn relkind(k: &str) -> &'static str {
         "p" => "partitioned table",
         _ => "table",
     }
-}
-
-/// Best effort: the catalog rows already name their schema, and the database name is
-/// context rather than content, so failing to learn it is not worth failing a refresh.
-fn current_database(_pool: &sqlx::PgPool) -> Option<String> {
-    None
 }
 
 fn columns_of(row: &PgRow) -> Vec<Column> {

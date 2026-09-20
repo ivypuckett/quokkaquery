@@ -8,6 +8,12 @@
 //! the engine had not recorded would be a hole in the log, which is why the SQLite
 //! driver refused them until the plumbing existed.
 
+// Everything here belongs to a driver, so a build with every driver switched off —
+// `cargo build -p quokka-driver --no-default-features`, which is a legitimate way to ask
+// "what does the trait seam cost on its own" — compiles to nothing rather than to a pile
+// of dead-code warnings.
+#![cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+
 use quokka_core::Value;
 
 /// How many rows may sit between a database and the consumer.

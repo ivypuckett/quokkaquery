@@ -6,6 +6,11 @@
 //! and which store would answer — never the value. `quokka credential status` is the
 //! command that asks whether one is actually there, because that is a question worth
 //! having to ask for.
+//!
+//! The one thing it does ask the platform is whether an OS keyring exists at all, which
+//! is what `credential_backend` reports. That opens no entry and reads no secret; it is
+//! the difference between "this password is in the Keychain" and "this password is in
+//! the encrypted file", which a person reading an inventory needs to know.
 
 use anyhow::Result;
 use quokka_core::{ConnectionConfig, Engine};
