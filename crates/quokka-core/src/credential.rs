@@ -58,6 +58,12 @@ pub enum CredentialError {
 
     #[error("credential reference {0:?} is not understood; expected \"keyring\", \"keyring:<service>/<account>\", \"env:<VAR>\" or \"none\"")]
     BadReference(String),
+
+    /// The reference is fine; there is simply nowhere for QuokkaQuery to put a value.
+    /// Distinct from [`CredentialError::BadReference`] because the fix is different:
+    /// this one is answered by editing the config file, not by correcting a typo.
+    #[error("connection {connection:?} keeps no credential of its own: {detail}")]
+    NotStorable { connection: String, detail: String },
 }
 
 /// Which store a reference resolves against.
@@ -210,15 +216,23 @@ pub async fn resolve_async(reference: &CredentialRef) -> Result<Option<Secret>, 
 }
 
 /// Save a credential, returning the store it landed in.
-pub fn store(reference: &CredentialRef, secret: &Secret) -> Result<Backend, CredentialError> {
+pub fn store(
+    connection: &str,
+    reference: &CredentialRef,
+    secret: &Secret,
+) -> Result<Backend, CredentialError> {
     match reference {
-        CredentialRef::None => Err(CredentialError::BadReference(
-            "this connection is configured with credential = \"none\"".to_string(),
-        )),
-        CredentialRef::Env { var } => Err(CredentialError::BadReference(format!(
-            "this connection reads ${var} from the environment; there is nothing for \
-             QuokkaQuery to store"
-        ))),
+        CredentialRef::None => Err(CredentialError::NotStorable {
+            connection: connection.to_string(),
+            detail: "it is configured with credential = \"none\"".to_string(),
+        }),
+        CredentialRef::Env { var } => Err(CredentialError::NotStorable {
+            connection: connection.to_string(),
+            detail: format!(
+                "it reads ${var} from the environment, so the value belongs to whoever \
+                 sets that variable"
+            ),
+        }),
         CredentialRef::Keyring { service, account } => {
             if os_keyring_available() {
                 keyring_set(reference, service, account, secret)?;

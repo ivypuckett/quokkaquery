@@ -15,16 +15,22 @@ path = "src/main.rs"
 [features]
 # `quokka-ui` arrives at M4 behind a default-on `ui` feature. Until then the default
 # build is already the headless one, so `--no-default-features` yields a working CLI.
+#
+# Note what is *not* behind a feature here: the drivers. `--no-default-features` exists
+# to drop the GUI stack for a container or an agent's box, and a headless Postgres
+# client is the most useful thing that build could be. One cargo feature per driver
+# (§3.0, hedge 2) lives on `quokka-driver`, where a slim build asks for it by name.
 default = []
 
 [dependencies]
 quokka-audit.workspace = true
 quokka-core.workspace = true
-quokka-driver = { workspace = true, features = ["sqlite"] }
+quokka-driver = { workspace = true, features = ["sqlite", "postgres", "mysql"] }
 
 anyhow.workspace = true
 clap.workspace = true
 futures.workspace = true
+rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }

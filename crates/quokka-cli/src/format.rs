@@ -266,3 +266,108 @@ fn cell(value: &Value) -> String {
         text
     }
 }
+
+/// Print a list of records that are not query rows — connections, catalog tables.
+///
+/// Kept beside the [`RowSink`] formats rather than folded into them, because these do
+/// not come from a database and must not look as though they did: `quokka connections
+/// list` reads the config file, and `quokka schema describe` reads a catalog that may
+/// have been cached, which is a distinction the `--format json` envelope makes explicit.
+///
+/// `columns` is the table format's column order and nothing more; the JSON forms print
+/// whatever the records hold.
+pub fn print_records(
+    format: Format,
+    envelope: Map<String, Json>,
+    key: &str,
+    records: Vec<Json>,
+    columns: &[&str],
+) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
+    match format {
+        Format::Json => {
+            let mut envelope = envelope;
+            envelope.insert(key.to_string(), Json::Array(records));
+            serde_json::to_writer(&mut out, &Json::Object(envelope))?;
+            out.write_all(b"\n")?;
+            out.flush()
+        }
+        Format::Ndjson => {
+            for record in &records {
+                serde_json::to_writer(&mut out, record)?;
+                out.write_all(b"\n")?;
+            }
+            out.flush()?;
+            // Same rule as the row sink: stdout stays a pure stream of records, so the
+            // envelope — which is not one — goes to stderr.
+            let mut err = std::io::stderr().lock();
+            serde_json::to_writer(&mut err, &Json::Object(envelope))?;
+            err.write_all(b"\n")?;
+            err.flush()
+        }
+        Format::Table => {
+            let rows: Vec<Vec<String>> = records
+                .iter()
+                .map(|r| columns.iter().map(|c| scalar(r.get(*c))).collect())
+                .collect();
+            write_table(&mut out, columns, &rows)?;
+            out.flush()
+        }
+    }
+}
+
+/// One aligned table. Shared by every `--format table` that is not a query result.
+pub fn write_table(
+    out: &mut impl Write,
+    headers: &[&str],
+    rows: &[Vec<String>],
+) -> std::io::Result<()> {
+    if headers.is_empty() {
+        return Ok(());
+    }
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if let Some(w) = widths.get_mut(i) {
+                *w = (*w).max(cell.chars().count());
+            }
+        }
+    }
+
+    let header: Vec<String> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| pad(h, widths[i]))
+        .collect();
+    writeln!(out, "{}", header.join("  "))?;
+    writeln!(
+        out,
+        "{}",
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  ")
+    )?;
+    for row in rows {
+        let line: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, c)| pad(c, widths.get(i).copied().unwrap_or(0)))
+            .collect();
+        writeln!(out, "{}", line.join("  ").trim_end())?;
+    }
+    Ok(())
+}
+
+/// A JSON value as one table cell. Nested values are printed compactly rather than
+/// elided, because a column list is exactly the thing you wanted to see.
+fn scalar(value: Option<&Json>) -> String {
+    match value {
+        None | Some(Json::Null) => String::new(),
+        Some(Json::String(s)) => s.clone(),
+        Some(Json::Bool(b)) => b.to_string(),
+        Some(Json::Number(n)) => n.to_string(),
+        Some(other) => other.to_string(),
+    }
+}
