@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use quokka_core::{
     Catalog, Column, ConnectionConfig, Driver, DriverError, DriverFactory, ExecutePermit,
-    MetaHandle, Plan, QueryHandle, QueryRequest, QueryStream, Row, Scope, Value,
+    MetaHandle, Plan, QueryHandle, QueryRequest, QueryStream, Row, Scope, TableInfo, Value,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{
@@ -21,11 +21,7 @@ use sqlx::{
 };
 use uuid::Uuid;
 
-/// How many rows may sit between the database and the consumer.
-///
-/// Bounded on purpose: the channel is the backpressure, so a large result never buffers
-/// in memory ahead of whoever is reading it.
-const ROW_CHANNEL_DEPTH: usize = 64;
+use crate::common::{self, ROW_CHANNEL_DEPTH};
 
 /// Opens SQLite connections.
 pub struct SqliteFactory;
@@ -105,19 +101,61 @@ impl Driver for SqliteDriver {
         })
     }
 
+    /// SQLite's catalog: `sqlite_master` for the objects, `pragma_table_info` for the
+    /// columns of each (§3.1).
+    ///
+    /// Only reachable through `quokka_core::introspect()`, which appends the single
+    /// `introspect` event afterwards (§5) — the [`ExecutePermit`] is what makes that
+    /// structural rather than a convention.
     async fn introspect(
         &self,
         _permit: &ExecutePermit,
-        _scope: Scope,
+        scope: Scope,
     ) -> Result<Catalog, DriverError> {
-        // Introspection is an M1 deliverable. Its audit story is now settled (§5: one
-        // `introspect` event per catalog refresh, appended after the fact), but the
-        // audited path in `quokka-core` that would emit it does not exist yet. Until it
-        // does, this returns nothing rather than quietly becoming a second, unlogged
-        // route to the database.
-        Err(DriverError::Unsupported(
-            "schema introspection arrives at M1".to_string(),
-        ))
+        let objects: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, type FROM sqlite_master \
+             WHERE type IN ('table','view') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+               AND (?1 IS NULL OR name = ?1) \
+             ORDER BY name",
+        )
+        .bind(scope.table.as_deref())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(execute_error)?;
+
+        let mut tables = Vec::with_capacity(objects.len());
+        for (name, kind) in objects {
+            // One `pragma_table_info` per object. N+1 against a local file is cheap, and
+            // it is the only way SQLite reports column types at all.
+            let columns: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT name, type, \"notnull\" FROM pragma_table_info(?) ORDER BY cid",
+            )
+            .bind(&name)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(execute_error)?;
+
+            tables.push(TableInfo {
+                database: scope.database.clone(),
+                // SQLite has attached databases rather than schemas, and `main` is the
+                // only one a connection of ours opens.
+                schema: None,
+                name,
+                kind: if kind == "view" { "view" } else { "table" }.to_string(),
+                columns: columns
+                    .into_iter()
+                    .map(|(name, driver_type, notnull)| Column {
+                        name,
+                        // An empty declared type is SQLite's "no affinity", not a
+                        // missing answer — it is reported as written.
+                        driver_type,
+                        nullable: Some(notnull == 0),
+                    })
+                    .collect(),
+            });
+        }
+
+        Ok(Catalog { tables })
     }
 
     async fn execute(
@@ -125,16 +163,6 @@ impl Driver for SqliteDriver {
         _permit: &ExecutePermit,
         req: QueryRequest,
     ) -> Result<QueryStream, DriverError> {
-        if !req.params.is_empty() {
-            // Binding parameters is straightforward, but `params` also has to be written
-            // to the audit log under the connection's `sql_logging` mode, and the CLI has
-            // no way to supply them yet. Refusing beats accepting values that would go
-            // unrecorded.
-            return Err(DriverError::Unsupported(
-                "bound parameters are not supported yet".to_string(),
-            ));
-        }
-
         // SQLite executes every statement in a multi-statement body, and the column
         // list below describes only the first. Rejecting stacked queries is
         // `quokka-policy`'s job at M3 (ARCHITECTURE §6.3); until then the log records
@@ -154,13 +182,25 @@ impl Driver for SqliteDriver {
 
         let pool = self.pool.clone();
         let sql = req.sql.clone();
+        let params = req.params.clone();
         let task_meta = meta.clone();
         let task_cancel = cancel.clone();
         let cancels = self.cancels.clone();
         let handle = req.handle;
 
         tokio::spawn(async move {
-            let mut stream = sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&pool);
+            // Two protocols, chosen by whether anything is bound. `raw_sql` runs a
+            // whole body — which is what a SQL file is — while a bound statement has to
+            // be prepared, and a prepared statement is a single statement by
+            // definition. Rejecting stacked statements outright is `quokka-policy`'s
+            // job at M3; until then this is only a shape difference, and the log
+            // records the whole body's fingerprint either way.
+            let mut stream = if params.is_empty() {
+                sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&pool).boxed()
+            } else {
+                let query = common::bind_all_sqlite(sqlx::query(AssertSqlSafe(sql)), &params);
+                <&SqlitePool as Executor>::fetch_many(&pool, query).boxed()
+            };
             while let Some(step) = stream.next().await {
                 if task_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(Err(DriverError::Cancelled)).await;
@@ -260,6 +300,12 @@ impl SqliteDriver {
     /// Exposed for tests that need to reach the file this driver opened.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+}
+
+fn execute_error(e: sqlx::Error) -> DriverError {
+    DriverError::Execute {
+        detail: e.to_string(),
     }
 }
 

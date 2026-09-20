@@ -23,8 +23,11 @@ use quokka_audit::{
 };
 use uuid::Uuid;
 
+use crate::catalog::CatalogCache;
 use crate::config::{dialect_hint, ConnectionConfig, Registry};
-use crate::driver::{Driver, DriverFactory, ExecutePermit, QueryHandle, QueryRequest};
+use crate::driver::{
+    Catalog, Driver, DriverFactory, ExecutePermit, QueryHandle, QueryRequest, Scope,
+};
 use crate::error::{CoreError, DriverError};
 use crate::redact::scrub;
 use crate::sql::summarize;
@@ -134,6 +137,10 @@ pub struct Engine {
     drivers: tokio::sync::Mutex<HashMap<String, Arc<dyn Driver>>>,
     /// Queries currently executing, so `cancel()` can find the driver that owns one.
     inflight: std::sync::Mutex<HashMap<Uuid, Arc<dyn Driver>>>,
+    /// Catalogs, per connection and scope, on a TTL (§3.1). A hit here is the one way
+    /// this program answers a question about a database without touching it — and
+    /// therefore the one way it answers without writing to the log (§5).
+    catalogs: CatalogCache,
     session_id: String,
 }
 
@@ -161,6 +168,7 @@ impl Engine {
                 .collect(),
             drivers: tokio::sync::Mutex::new(HashMap::new()),
             inflight: std::sync::Mutex::new(HashMap::new()),
+            catalogs: CatalogCache::new(),
             session_id: Uuid::now_v7().to_string(),
         }
     }
@@ -400,6 +408,213 @@ pub async fn execute(
     Ok(outcome)
 }
 
+/// One request to refresh part of a connection's catalog.
+#[derive(Debug, Clone)]
+pub struct IntrospectRequest {
+    pub connection: String,
+    pub scope: Scope,
+    pub actor: Actor,
+    pub client: Client,
+    /// Query the server even if the cached catalog is still within the TTL.
+    ///
+    /// §1.4 makes refreshing an explicit action; this is the flag a "Refresh catalog"
+    /// button sets. It is never set by autocomplete.
+    pub refresh: bool,
+}
+
+impl IntrospectRequest {
+    pub fn new(connection: impl Into<String>, scope: Scope, actor: Actor) -> Self {
+        Self {
+            connection: connection.into(),
+            scope,
+            actor,
+            client: Client::Cli,
+            refresh: false,
+        }
+    }
+}
+
+/// A catalog, and the honest account of where it came from.
+#[derive(Debug, Clone)]
+pub struct CatalogResult {
+    pub catalog: Catalog,
+    /// `true` when nothing reached a database. Then `event_id` is `None`, because a hit
+    /// appends no event at all (§5).
+    pub from_cache: bool,
+    /// The single `introspect` row this refresh appended — never a pair.
+    pub event_id: Option<Uuid>,
+    pub duration_ms: i64,
+}
+
+/// Refresh part of a catalog, on the audited path §5 specifies.
+///
+/// Three things about this differ from [`execute()`], and each is a decision in §5
+/// rather than a shortcut:
+///
+/// 1. **One event, appended after the fact** — not a `query_started`/`query_finished`
+///    pair. The statement is the driver's own and bounded, so there is no outcome to
+///    hold open and no caller SQL to record having attempted.
+/// 2. **Fail-closed does not apply.** There is no "before" event to fail. A failed
+///    append is surfaced loudly instead, exactly as a failed `query_finished` is.
+/// 3. **A cache hit appends nothing.** Nothing reached a database, so there is nothing
+///    to describe. At a one-minute TTL this is the difference between a handful of rows
+///    a day and thousands — and, more to the point, between a log that says what
+///    happened and one that says what was asked.
+///
+/// This holds only while introspection cannot carry caller-supplied SQL. `Scope` is a
+/// scope and never a statement; the day a surface wants to run its own catalog query,
+/// that is a `query_started`/`query_finished` pair like any other, because it is one.
+pub async fn introspect(
+    engine: &Engine,
+    request: IntrospectRequest,
+) -> Result<CatalogResult, CoreError> {
+    let cfg = engine
+        .registry
+        .get(&request.connection)
+        .cloned()
+        .ok_or_else(|| CoreError::UnknownConnection(request.connection.clone()))?;
+
+    if !request.refresh {
+        if let Some(catalog) = engine
+            .catalogs
+            .get(&cfg.name, &request.scope, cfg.catalog_ttl)
+        {
+            return Ok(CatalogResult {
+                catalog,
+                from_cache: true,
+                event_id: None,
+                duration_ms: 0,
+            });
+        }
+    }
+
+    let started_at = Instant::now();
+    let outcome = refresh(engine, &cfg, &request.scope).await;
+    let duration_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+
+    let (status, error_code, error_message, tables) = match &outcome {
+        Ok(catalog) => (Status::Ok, None, None, Some(catalog.tables.len() as i64)),
+        Err(e) => (
+            Status::Error,
+            Some(e.code().to_string()),
+            Some(scrub(&e.to_string())),
+            None,
+        ),
+    };
+
+    let dialect = dialect_hint(&cfg.driver);
+    let event_id = Uuid::now_v7();
+    let event = AuditEvent {
+        id: event_id,
+        // Its own group of one. An introspect event is not part of a query's story, so
+        // it does not borrow a query's id; `queries` joins on `query_started`, so this
+        // row stays out of that view by construction.
+        query_id: Uuid::now_v7(),
+        parent_id: None,
+        at: quokka_audit::now_rfc3339()?,
+        duration_ms: Some(duration_ms),
+        actor_kind: request.actor.kind,
+        actor_id: request.actor.id.clone(),
+        session_id: engine.session_id.clone(),
+        client: request.client,
+        connection: cfg.name.clone(),
+        dialect: dialect.as_str().to_string(),
+        database: request
+            .scope
+            .database
+            .clone()
+            .or_else(|| cfg.database.clone()),
+        schema_name: request.scope.schema.clone().or_else(|| cfg.schema.clone()),
+        event_kind: EventKind::Introspect,
+        sql_logging: cfg.sql_logging,
+        // Deliberately empty even at `full`: the SQL that ran is the driver's, not the
+        // caller's, and it is the same text on every refresh. What review needs from
+        // this row is the scope, which is below.
+        sql_text: None,
+        sql_fingerprint: scope_fingerprint(&request.scope),
+        statement_kind: Some("introspect".to_string()),
+        read_only: Some(true),
+        params: None,
+        status,
+        error_code,
+        error_message,
+        // How many catalog objects came back. A count, not content: invariant 4 forbids
+        // rows, samples and digests of rows, and this is the same kind of number
+        // `rows_returned` already holds for a query. It is the difference between a
+        // refresh that found four hundred tables and one that found none.
+        rows_returned: tables,
+        rows_affected: None,
+        rows_spooled: None,
+        truncated: None,
+        export_format: None,
+        export_path: None,
+        data_scanned_bytes: None,
+        cost_estimate_usd: None,
+        approved_by: None,
+        tags: None,
+    };
+
+    engine
+        .audit
+        .append(event)
+        .await
+        .map_err(|source| CoreError::IntrospectNotRecorded { source })?;
+
+    let catalog = outcome?;
+    // Cached only once the event is on disk. If the append failed we returned above with
+    // the catalog dropped, so the next attempt queries again and tries to log again —
+    // rather than serving a refresh the log never heard about.
+    engine
+        .catalogs
+        .put(&cfg.name, &request.scope, catalog.clone());
+
+    Ok(CatalogResult {
+        catalog,
+        from_cache: false,
+        event_id: Some(event_id),
+        duration_ms,
+    })
+}
+
+async fn refresh(
+    engine: &Engine,
+    cfg: &ConnectionConfig,
+    scope: &Scope,
+) -> Result<Catalog, DriverError> {
+    let driver = engine.driver_for(cfg).await.map_err(|e| match e {
+        CoreError::Driver(d) => d,
+        other => DriverError::Connect {
+            connection: cfg.name.clone(),
+            detail: other.to_string(),
+        },
+    })?;
+    let permit = ExecutePermit::issue();
+    driver.introspect(&permit, scope.clone()).await
+}
+
+/// What the `sql_fingerprint` column holds for an `introspect` row.
+///
+/// The column is `NOT NULL` and exists to say *what* was touched, so a scope descriptor
+/// is the honest value: there is no caller statement to normalize. Identifiers survive
+/// normalization everywhere else in the log (§5.1, rule 2), so naming the table here is
+/// consistent rather than an exception.
+fn scope_fingerprint(scope: &Scope) -> String {
+    let parts: Vec<&str> = [
+        scope.database.as_deref(),
+        scope.schema.as_deref(),
+        scope.table.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if parts.is_empty() {
+        "INTROSPECT *".to_string()
+    } else {
+        format!("INTROSPECT {}", parts.join("."))
+    }
+}
+
 /// How far a run got before it stopped.
 #[derive(Debug, Default)]
 struct Partial {
@@ -501,6 +716,11 @@ impl Drop for InflightGuard<'_> {
 }
 
 impl RunFailure {
+    // Every message below is scrubbed on the way in. §5 puts secret scrubbing before
+    // *every* write, and an error is a write: a driver's failure text can carry whatever
+    // was in the statement, and a connection error from a wire-protocol driver can carry
+    // a DSN. Scrubbing here rather than at the audit event covers the terminal too,
+    // which is the other place a password must not appear.
     fn from_driver(e: DriverError, partial: Partial) -> Self {
         let status = match e {
             DriverError::Cancelled => Status::Cancelled,
@@ -509,7 +729,7 @@ impl RunFailure {
         RunFailure {
             status,
             code: e.code().to_string(),
-            message: e.to_string(),
+            message: scrub(&e.to_string()),
             partial,
         }
     }
@@ -518,7 +738,7 @@ impl RunFailure {
         RunFailure {
             status: Status::Error,
             code: "sink.io".to_string(),
-            message: e.to_string(),
+            message: scrub(&e.to_string()),
             partial,
         }
     }
@@ -532,7 +752,7 @@ impl RunFailure {
         RunFailure {
             status: Status::Error,
             code,
-            message: e.to_string(),
+            message: scrub(&e.to_string()),
             partial,
         }
     }

@@ -29,12 +29,17 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
-      # --all-targets so tests and examples are linted too, not just the libraries.
+      # --all-targets so tests and examples are linted too, not just the libraries, and
+      # --all-features so the container-backed tests are compiled and linted here even
+      # though they are run in the `containers` job below.
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # Deliberately *not* --all-features: that would switch on quokka-driver's
+      # `docker-tests`, and CLAUDE.md says the default `cargo test` must pass with no
+      # Docker. Every driver is still built, because the CLI depends on all three.
       - name: cargo test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
 
   platforms:
     name: test (${{ matrix.os }})
@@ -51,7 +56,27 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
+
+  containers:
+    name: container-backed driver tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # ARCHITECTURE §9: Postgres and MySQL are tested against real servers via
+      # testcontainers, behind a feature so the jobs above need no Docker. This is the
+      # one place the wire-protocol drivers meet a real server — whether an hstore
+      # degrades to a string rather than aborting a result set, whether
+      # `default_transaction_read_only` actually refuses a write, whether a rejected
+      # password stays out of the error text. None of those can be checked against a
+      # fake, so if this job stops running, the drivers stop being tested.
+      #
+      # Docker is preinstalled on the GitHub-hosted ubuntu runners, so there is nothing
+      # to set up here.
+      - name: cargo test --features docker-tests
+        run: cargo test --package quokka-driver --features docker-tests
 
   headless:
     name: headless build has no GUI dependencies
@@ -67,19 +92,40 @@ jobs:
       # no wgpu/winit in the tree. Trivially true until `quokka-ui` arrives at M4, which
       # is exactly why the guard belongs here before it does — the commit that breaks
       # this is the one that adds the UI without gating it.
+      # Note the here-strings. Piping into `grep -q` looks equivalent and is not: a
+      # match makes grep exit immediately, `echo` takes SIGPIPE, and `pipefail` then
+      # reports the whole pipeline as failed. For this check that means the guard fails
+      # *open* — a GUI dependency would make grep match, the pipeline "fail", and the
+      # `if` go false, so the error would never be printed. A here-string has no pipe
+      # and no second process to kill.
       - name: no wgpu/winit in the headless tree
         run: |
           set -euo pipefail
           tree=$(cargo tree --package quokkaquery --no-default-features --edges normal)
-          if echo "$tree" | grep -Eiq '\b(wgpu|winit|webkit2gtk|iced)'; then
+          if grep -Eiq '\b(wgpu|winit|webkit2gtk|iced)' <<<"$tree"; then
             echo "::error::a GUI dependency reached the headless build:"
-            echo "$tree" | grep -Ei '\b(wgpu|winit|webkit2gtk|iced)'
+            grep -Ei '\b(wgpu|winit|webkit2gtk|iced)' <<<"$tree"
             exit 1
           fi
           echo "headless tree is clean"
 
       - name: the headless binary runs
         run: cargo run --package quokkaquery --no-default-features -- --version
+
+      # The drivers are not behind a CLI feature, so the headless build is a full
+      # database client rather than a SQLite-only one. Checking it here keeps that a
+      # decision rather than an accident.
+      - name: the headless build still carries every driver
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --package quokkaquery --no-default-features --edges normal)
+          for driver in sqlite postgres mysql; do
+            if ! grep -q "sqlx-$driver" <<<"$tree"; then
+              echo "::error::the headless build dropped the $driver driver"
+              exit 1
+            fi
+          done
+          echo "headless tree carries sqlite, postgres and mysql"
 
   msrv:
     name: builds on the declared rust-version

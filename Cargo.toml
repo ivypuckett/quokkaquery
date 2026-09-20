@@ -32,11 +32,34 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlparser = { version = "0.63", features = ["visitor"] }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+# `tls-rustls-ring-native-roots`, not native-tls: §3.0 wants no linking against system
+# client libraries, and rustls is pure Rust. The *roots* still come from the OS trust
+# store, because the databases people actually connect to are as often behind a company
+# CA as behind a public one, and a bundled root set cannot see those.
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "tls-rustls-ring-native-roots",
+] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v7", "serde"] }
 
+# Credentials (§5). `keyring` 4.x is a thin facade over `keyring-core` whose `v1`
+# feature picks the OS store per platform — Keychain, Credential Manager, Secret
+# Service over zbus (pure Rust; the libdbus-linking store is a different feature we do
+# not enable). The rest is the encrypted-file fallback for a headless box with no
+# Secret Service: XChaCha20-Poly1305 over an Argon2id-derived key, both pure Rust.
+keyring = "4"
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+getrandom = "0.4"
+rpassword = "7"
+zeroize = "1"
+
 tempfile = "3"
+# Container-backed tests only (§9), behind quokka-driver's `docker-tests` feature.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }

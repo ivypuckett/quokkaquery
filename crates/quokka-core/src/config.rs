@@ -6,15 +6,63 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use quokka_audit::SqlLogging;
 use serde::Deserialize;
 
+use crate::credential::CredentialRef;
 use crate::error::CoreError;
 use crate::value::Dialect;
 
 /// The name of the built-in connection that exposes the audit log itself (§5).
 pub const AUDIT_CONNECTION: &str = "@audit";
+
+/// How long a catalog refresh stays fresh before the next one is allowed to query
+/// (§3.1). Per-connection, `catalog_ttl` in the config file.
+///
+/// Sixty seconds is short enough that a migration you just ran shows up and long enough
+/// that autocomplete never waits — and a cache *hit* costs nothing at all, including in
+/// the log, because nothing reached a database (§5).
+pub const DEFAULT_CATALOG_TTL: Duration = Duration::from_secs(60);
+
+/// How long a connection attempt may keep trying before it is called a failure.
+///
+/// sqlx's pool retries a refused or unreachable server until its acquire timeout, which
+/// defaults to thirty seconds. That is sensible for a long-lived service riding out a
+/// restart and wrong for a CLI: a typo in `host` should be a message, not half a minute
+/// of silence. Ten seconds is long enough to cross a slow VPN and short enough to feel
+/// like an answer.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What TLS the driver asks for on a network connection.
+///
+/// The names are libpq's, because that is the vocabulary anyone configuring a Postgres
+/// client already has. `prefer` is the default for the same reason it is libpq's: a
+/// local development database with no TLS at all must still connect, and a tool that
+/// refused would be uninstalled rather than configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    Disable,
+    #[default]
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl TlsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TlsMode::Disable => "disable",
+            TlsMode::Prefer => "prefer",
+            TlsMode::Require => "require",
+            TlsMode::VerifyCa => "verify-ca",
+            TlsMode::VerifyFull => "verify-full",
+        }
+    }
+}
 
 /// Whether a connection may be written to.
 ///
@@ -45,6 +93,12 @@ impl AccessMode {
 }
 
 /// One configured connection.
+///
+/// Note what is *not* here: a password. The config file holds a [`CredentialRef`] — the
+/// name of a keyring entry or an environment variable — and the value is fetched inside
+/// a driver's `connect` as a [`Secret`](crate::Secret), which cannot be printed or
+/// serialized (§5). That is why this struct can derive `Debug` and be handed to
+/// `quokka connections list` without a redaction pass.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConnectionConfig {
     pub name: String,
@@ -52,13 +106,103 @@ pub struct ConnectionConfig {
     pub driver: String,
     /// SQLite: the database file.
     pub path: Option<PathBuf>,
+    /// Postgres / MySQL: the server. A value starting with `/` is a unix socket
+    /// directory rather than a hostname.
+    pub host: Option<String>,
+    /// Defaults to the driver's standard port when absent.
+    pub port: Option<u16>,
+    /// The login role. Defaults to the OS user for the wire-protocol drivers.
+    pub user: Option<String>,
+    /// Where the password lives — never the password.
+    pub credential: CredentialRef,
+    pub tls: TlsMode,
     pub mode: AccessMode,
     pub sql_logging: SqlLogging,
-    /// Recorded on every audit row for this connection.
+    /// Recorded on every audit row for this connection, and, for the wire-protocol
+    /// drivers, the database actually connected to.
     pub database: Option<String>,
     pub schema: Option<String>,
+    /// How long a catalog refresh stays fresh (§3.1).
+    pub catalog_ttl: Duration,
+    /// How long to keep trying to connect before reporting a failure.
+    pub connect_timeout: Duration,
     /// True for `@audit`, which the registry supplies rather than the config file.
     pub builtin: bool,
+}
+
+impl ConnectionConfig {
+    /// A connection with everything at its default: read-only, `fingerprint`, its own
+    /// name in the keyring, and no network details.
+    ///
+    /// Invariants 8 and 9 both live in this function — a connection that says nothing is
+    /// the safe one — so a caller building a config by hand cannot accidentally opt out
+    /// of either by forgetting a field.
+    pub fn new(name: impl Into<String>, driver: impl Into<String>) -> Self {
+        let name = name.into();
+        let credential = CredentialRef::default_for(&name);
+        Self {
+            name,
+            driver: driver.into(),
+            path: None,
+            host: None,
+            port: None,
+            user: None,
+            credential,
+            tls: TlsMode::default(),
+            mode: AccessMode::default(),
+            sql_logging: SqlLogging::default(),
+            database: None,
+            schema: None,
+            catalog_ttl: DEFAULT_CATALOG_TTL,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            builtin: false,
+        }
+    }
+
+    /// The port to dial: what was configured, else the driver's standard one.
+    pub fn effective_port(&self) -> Option<u16> {
+        self.port.or_else(|| default_port(&self.driver))
+    }
+
+    /// The dialect implied by the driver name.
+    pub fn dialect(&self) -> Dialect {
+        dialect_hint(&self.driver)
+    }
+
+    /// A human-readable target, for error messages and `connections list`.
+    ///
+    /// Assembled from the parts rather than from a DSN on purpose: there is no string
+    /// anywhere in this program that holds both the host and the password, so none can
+    /// leak into a log line (§5, and the M1 trap that a sqlx connection error can carry
+    /// a DSN).
+    pub fn target(&self) -> String {
+        if let Some(path) = &self.path {
+            return path.display().to_string();
+        }
+        let Some(host) = &self.host else {
+            return self.name.clone();
+        };
+        let user = self.user.as_deref().unwrap_or("");
+        let at = if user.is_empty() { "" } else { "@" };
+        let port = match self.effective_port() {
+            Some(p) => format!(":{p}"),
+            None => String::new(),
+        };
+        let database = match &self.database {
+            Some(d) => format!("/{d}"),
+            None => String::new(),
+        };
+        format!("{user}{at}{host}{port}{database}")
+    }
+}
+
+/// The port a driver uses when the config file does not say.
+pub fn default_port(driver: &str) -> Option<u16> {
+    match driver {
+        "postgres" => Some(5432),
+        "mysql" => Some(3306),
+        _ => None,
+    }
 }
 
 /// A connection as the TOML file spells it.
@@ -69,6 +213,18 @@ struct ConnectionFile {
     #[serde(default)]
     path: Option<PathBuf>,
     #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    user: Option<String>,
+    /// `keyring` | `keyring:<service>/<account>` | `env:<VAR>` | `none`.
+    /// Absent means this connection's own name in the default keyring service.
+    #[serde(default)]
+    credential: Option<String>,
+    #[serde(default)]
+    tls: TlsMode,
+    #[serde(default)]
     mode: AccessMode,
     /// `fingerprint` unless the connection opted in — invariant 8.
     #[serde(default, deserialize_with = "de_sql_logging")]
@@ -77,6 +233,12 @@ struct ConnectionFile {
     database: Option<String>,
     #[serde(default)]
     schema: Option<String>,
+    /// `"60s"`, `"5m"`, `"0"` to cache nothing.
+    #[serde(default)]
+    catalog_ttl: Option<String>,
+    /// `"10s"` by default.
+    #[serde(default)]
+    connect_timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -145,19 +307,58 @@ impl Registry {
                         ),
                     });
                 }
-                registry.connections.insert(
-                    name.clone(),
-                    ConnectionConfig {
-                        name,
-                        driver: c.driver,
-                        path: c.path,
-                        mode: c.mode,
-                        sql_logging: c.sql_logging,
-                        database: c.database,
-                        schema: c.schema,
-                        builtin: false,
-                    },
-                );
+                let bad = |detail: String| CoreError::Config {
+                    path: path.clone(),
+                    detail: format!("connection {name:?}: {detail}"),
+                };
+
+                let credential = match &c.credential {
+                    Some(text) => {
+                        CredentialRef::parse(text, &name).map_err(|e| bad(e.to_string()))?
+                    }
+                    None => CredentialRef::default_for(&name),
+                };
+                let catalog_ttl = match &c.catalog_ttl {
+                    Some(text) => parse_duration(text).ok_or_else(|| {
+                        bad(format!(
+                            "catalog_ttl {text:?} is not a duration; write it as \"60s\", \
+                             \"5m\", \"1h\", or \"0\" to cache nothing"
+                        ))
+                    })?,
+                    None => DEFAULT_CATALOG_TTL,
+                };
+                let connect_timeout = match &c.connect_timeout {
+                    Some(text) => parse_duration(text).ok_or_else(|| {
+                        bad(format!(
+                            "connect_timeout {text:?} is not a duration; write it as \"10s\" \
+                             or \"1m\""
+                        ))
+                    })?,
+                    None => DEFAULT_CONNECT_TIMEOUT,
+                };
+
+                let cfg = ConnectionConfig {
+                    name: name.clone(),
+                    driver: c.driver,
+                    path: c.path,
+                    host: c.host,
+                    port: c.port,
+                    user: c.user,
+                    credential,
+                    tls: c.tls,
+                    mode: c.mode,
+                    sql_logging: c.sql_logging,
+                    database: c.database,
+                    schema: c.schema,
+                    catalog_ttl,
+                    connect_timeout,
+                    builtin: false,
+                };
+                if let Err(detail) = check(&cfg) {
+                    return Err(bad(detail));
+                }
+
+                registry.connections.insert(name, cfg);
             }
         }
 
@@ -204,12 +405,79 @@ fn audit_connection(audit_db: &Path) -> ConnectionConfig {
         name: AUDIT_CONNECTION.to_string(),
         driver: "sqlite".to_string(),
         path: Some(audit_db.to_path_buf()),
+        host: None,
+        port: None,
+        user: None,
+        // Invariant: `@audit` stays SQLite and read-only however many drivers exist, so
+        // it has nothing to authenticate to and nothing to look up.
+        credential: CredentialRef::None,
+        tls: TlsMode::Disable,
         mode: AccessMode::ReadOnly,
         sql_logging: SqlLogging::Fingerprint,
         database: Some("audit".to_string()),
         schema: None,
+        catalog_ttl: DEFAULT_CATALOG_TTL,
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         builtin: true,
     }
+}
+
+/// What a connection must have for its driver to stand a chance.
+///
+/// Caught here rather than at connect time so that a typo in the config file is a
+/// message about the config file, not a connection error twenty seconds later.
+fn check(cfg: &ConnectionConfig) -> Result<(), String> {
+    match cfg.driver.as_str() {
+        "sqlite" => {
+            if cfg.path.is_none() {
+                return Err("a sqlite connection needs `path` to a database file".to_string());
+            }
+            if cfg.host.is_some() {
+                return Err("a sqlite connection has no `host`; it has a `path`".to_string());
+            }
+        }
+        "postgres" | "mysql" => {
+            if cfg.host.is_none() {
+                return Err(format!(
+                    "a {} connection needs a `host` (a path starting with `/` means a \
+                     unix socket directory)",
+                    cfg.driver
+                ));
+            }
+            if cfg.path.is_some() {
+                return Err(format!(
+                    "a {} connection has no `path`; set `host`, `port`, `database` and \
+                     `user` instead",
+                    cfg.driver
+                ));
+            }
+        }
+        // An unknown driver is the engine's error to report, with the list of what this
+        // build includes. Guessing at its required fields here would be worse.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `"90s"`, `"5m"`, `"2h"`, or a bare number of seconds. `0` disables caching.
+fn parse_duration(text: &str) -> Option<Duration> {
+    let text = text.trim();
+    let (digits, scale) = match text.strip_suffix(|c: char| c.is_ascii_alphabetic()) {
+        Some(rest) => {
+            let unit = &text[rest.len()..];
+            let scale = match unit {
+                "s" => 1,
+                "m" => 60,
+                "h" => 3600,
+                "d" => 86_400,
+                _ => return None,
+            };
+            (rest, scale)
+        }
+        None => (text, 1),
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    Some(Duration::from_secs(n.checked_mul(scale)?))
 }
 
 /// `$QUOKKA_CONFIG`, else `<XDG config dir>/quokkaquery/config.toml`.

@@ -1,15 +1,23 @@
-//! `quokka` — the CLI, and at M0 the only surface.
+//! `quokka` — the CLI, and until M3's MCP server the only surface.
 //!
 //! Stable, machine-first output: `--format json` for a single envelope, `--format
 //! ndjson` for streaming, errors as JSON on stderr with meaningful exit codes
 //! (ARCHITECTURE §6.1).
 //!
-//! Every subcommand that runs SQL goes through `quokka_core::execute()` — including the
-//! `audit` subcommands, which are wrappers over queries against the built-in `@audit`
-//! connection rather than a second way into the log (§5). Reading the audit log is
-//! itself an audited query, which is the point.
+//! Every subcommand that reaches a database goes through `quokka-core` — `execute()`
+//! for SQL, `introspect()` for a catalog — including the `audit` subcommands, which are
+//! wrappers over queries against the built-in `@audit` connection rather than a second
+//! way into the log (§5). Reading the audit log is itself an audited query, which is the
+//! point.
+//!
+//! `connections list` and `credential` are the exceptions that prove it: neither reaches
+//! a database at all. One reads the config file and the other the OS keyring, so neither
+//! has anything to log.
 
+mod connections;
+mod credential;
 mod format;
+mod schema;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,14 +26,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use quokka_core::{
-    execute, Actor, ActorKind, AuditLog, Client, Engine, ExecuteRequest, Registry, Status,
+    execute, Actor, ActorKind, AuditLog, Client, Engine, ExecuteRequest, Registry, Status, Value,
     AUDIT_CONNECTION, DEFAULT_MAX_ROWS,
 };
 
 use crate::format::{sink_for, Format};
 
 /// Exit codes, so a script can tell the failures apart (§6.1).
-mod exit {
+pub mod exit {
     /// The query ran and the log recorded it.
     pub const OK: u8 = 0;
     /// The query ran and failed, or was cancelled.
@@ -91,9 +99,91 @@ impl From<ActorKindArg> for ActorKind {
 enum Command {
     /// Run SQL against a connection.
     Query(QueryArgs),
+    /// Show the configured connections.
+    #[command(subcommand)]
+    Connections(ConnectionsCommand),
+    /// Read a connection's catalog.
+    #[command(subcommand)]
+    Schema(SchemaCommand),
+    /// Store, remove and check connection credentials.
+    #[command(subcommand)]
+    Credential(CredentialCommand),
     /// Read and check the audit log.
     #[command(subcommand)]
     Audit(AuditCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum ConnectionsCommand {
+    /// List every connection this build can reach, and where each keeps its credential.
+    List(ConnectionsListArgs),
+}
+
+#[derive(Debug, Args)]
+struct ConnectionsListArgs {
+    #[arg(long, value_enum, default_value = "table")]
+    format: Format,
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Describe a table, or the whole catalog when no table is named.
+    ///
+    /// Leaves exactly one `introspect` event in the audit log — never a
+    /// query_started/query_finished pair (§5).
+    Describe(SchemaDescribeArgs),
+}
+
+#[derive(Debug, Args)]
+struct SchemaDescribeArgs {
+    #[arg(short, long, value_name = "NAME")]
+    connection: String,
+
+    /// `table`, `schema.table` or `database.schema.table`. Omit it to describe
+    /// everything the connection can see.
+    #[arg(value_name = "TABLE")]
+    table: Option<String>,
+
+    /// Narrow to a schema. Also the way to reach a table whose name contains a dot.
+    #[arg(long, value_name = "NAME")]
+    schema: Option<String>,
+
+    #[arg(long, value_name = "NAME")]
+    database: Option<String>,
+
+    /// Query the server even if this process cached the answer less than
+    /// `catalog_ttl` ago. Refreshing is an explicit action, never an implicit one (§1.4).
+    #[arg(long)]
+    refresh: bool,
+
+    #[arg(long, value_enum, default_value = "table")]
+    format: Format,
+}
+
+#[derive(Debug, Subcommand)]
+enum CredentialCommand {
+    /// Store a connection's credential. Read from a terminal without echo, or from
+    /// stdin — never from the command line, where it would land in shell history.
+    Set(CredentialOneArgs),
+    /// Remove a connection's stored credential.
+    Delete(CredentialOneArgs),
+    /// Say where each credential lives and whether one is stored. Never the value.
+    Status(CredentialStatusArgs),
+}
+
+#[derive(Debug, Args)]
+struct CredentialOneArgs {
+    #[arg(value_name = "CONNECTION")]
+    connection: String,
+}
+
+#[derive(Debug, Args)]
+struct CredentialStatusArgs {
+    #[arg(value_name = "CONNECTION")]
+    connection: Option<String>,
+
+    #[arg(long, value_enum, default_value = "table")]
+    format: Format,
 }
 
 #[derive(Debug, Args)]
@@ -117,6 +207,67 @@ struct QueryArgs {
     /// pipeline is not a context window, so here it may be raised.
     #[arg(long, value_name = "N", default_value_t = DEFAULT_MAX_ROWS)]
     max_rows: u64,
+
+    /// Bind a value, in order. `[type:]value`, where type is one of `text`, `int`,
+    /// `float`, `bool`, `blob` (hex) or `null`; anything else is text.
+    ///
+    /// Bound values follow the connection's `sql_logging` exactly as the query text
+    /// does (§5.1, rule 1): at `full` they are written to the log, at `fingerprint`
+    /// only how many there were.
+    #[arg(long = "param", value_name = "[TYPE:]VALUE")]
+    params: Vec<String>,
+}
+
+/// Parse one `--param`.
+///
+/// The prefix has to be explicit because a query tool cannot guess: `42` is a perfectly
+/// good string and `'42'` is a perfectly good integer, and picking wrong turns an index
+/// scan into a sequential one, or a match into a type error. A value with no recognized
+/// prefix is text, which is both the common case and the safe one; a literal string
+/// starting with `int:` is written `text:int:…`.
+fn parse_param(text: &str) -> Result<Value> {
+    let (kind, rest) = match text.split_once(':') {
+        Some((k, r)) => (k, r),
+        None => ("", text),
+    };
+    Ok(match kind {
+        "text" | "str" => Value::Text(rest.to_string()),
+        "int" => Value::Int(
+            rest.trim()
+                .parse()
+                .with_context(|| format!("--param {text:?}: {rest:?} is not an integer"))?,
+        ),
+        "float" => Value::Float(
+            rest.trim()
+                .parse()
+                .with_context(|| format!("--param {text:?}: {rest:?} is not a number"))?,
+        ),
+        "bool" => Value::Bool(match rest.trim() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            other => anyhow::bail!("--param {text:?}: {other:?} is not true or false"),
+        }),
+        "blob" => Value::Blob(decode_hex(rest.trim()).with_context(|| {
+            format!("--param {text:?}: a blob is written as hexadecimal, e.g. blob:0badc0de")
+        })?),
+        _ if text == "null" => Value::Null,
+        // Not a prefix we know, so the whole thing — colon included — is the value.
+        _ => Value::Text(text.to_string()),
+    })
+}
+
+fn decode_hex(text: &str) -> Result<Vec<u8>> {
+    let text = text.strip_prefix("0x").unwrap_or(text);
+    if !text.len().is_multiple_of(2) {
+        anyhow::bail!("hexadecimal needs an even number of digits");
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&text[i..i + 2], 16)
+                .with_context(|| format!("{:?} is not hexadecimal", &text[i..i + 2]))
+        })
+        .collect()
 }
 
 #[derive(Debug, Subcommand)]
@@ -189,6 +340,12 @@ async fn main() -> ExitCode {
 fn error_format(cli: &Cli) -> Format {
     match &cli.command {
         Command::Query(a) => a.format,
+        Command::Connections(ConnectionsCommand::List(a)) => a.format,
+        Command::Schema(SchemaCommand::Describe(a)) => a.format,
+        Command::Credential(CredentialCommand::Status(a)) => a.format,
+        // `credential set` and `delete` have no output format to match: they print a
+        // sentence to stderr and nothing to stdout, on purpose.
+        Command::Credential(_) => Format::Table,
         Command::Audit(AuditCommand::Tail(a)) => a.format,
         Command::Audit(AuditCommand::Query(a)) => a.format,
         Command::Audit(AuditCommand::Verify(a)) => a.format,
@@ -220,21 +377,56 @@ async fn run(cli: Cli) -> Result<u8> {
     let code = match cli.command {
         Command::Query(args) => {
             let sql = read_sql(&args)?;
+            let params = args
+                .params
+                .iter()
+                .map(|p| parse_param(p))
+                .collect::<Result<Vec<_>>>()?;
             run_query(
                 &engine,
                 &args.connection,
                 &sql,
+                params,
                 args.format,
                 args.max_rows,
                 actor,
             )
             .await?
         }
+        Command::Connections(ConnectionsCommand::List(args)) => {
+            connections::list(&engine, args.format)?
+        }
+        Command::Schema(SchemaCommand::Describe(args)) => {
+            let scope = schema::parse_scope(
+                args.table.as_deref(),
+                args.database.as_deref(),
+                args.schema.as_deref(),
+            );
+            schema::describe(
+                &engine,
+                &args.connection,
+                scope,
+                args.refresh,
+                args.format,
+                actor,
+            )
+            .await?
+        }
+        Command::Credential(CredentialCommand::Set(args)) => {
+            credential::set(&engine, &args.connection)?
+        }
+        Command::Credential(CredentialCommand::Delete(args)) => {
+            credential::delete(&engine, &args.connection)?
+        }
+        Command::Credential(CredentialCommand::Status(args)) => {
+            credential::status(&engine, args.connection.as_deref(), args.format)?
+        }
         Command::Audit(AuditCommand::Query(args)) => {
             run_query(
                 &engine,
                 AUDIT_CONNECTION,
                 &args.sql,
+                Vec::new(),
                 args.format,
                 args.max_rows,
                 actor,
@@ -247,6 +439,7 @@ async fn run(cli: Cli) -> Result<u8> {
                 &engine,
                 AUDIT_CONNECTION,
                 &sql,
+                Vec::new(),
                 args.format,
                 args.limit,
                 actor,
@@ -274,10 +467,12 @@ fn watch_for_interrupt(engine: Arc<Engine>) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_query(
     engine: &Engine,
     connection: &str,
     sql: &str,
+    params: Vec<Value>,
     format: Format,
     max_rows: u64,
     actor: Actor,
@@ -286,6 +481,7 @@ async fn run_query(
     let mut request = ExecuteRequest::new(connection, sql, actor);
     request.client = Client::Cli;
     request.max_rows = max_rows;
+    request.params = params;
 
     let outcome = execute(engine, request, sink.as_mut()).await?;
 
@@ -424,6 +620,7 @@ fn classify(e: &anyhow::Error) -> u8 {
     match e.downcast_ref::<quokka_core::CoreError>() {
         Some(quokka_core::CoreError::AuditWriteFailed { .. })
         | Some(quokka_core::CoreError::AuditFinishFailed { .. })
+        | Some(quokka_core::CoreError::IntrospectNotRecorded { .. })
         | Some(quokka_core::CoreError::Audit(_)) => exit::AUDIT_FAILED,
         Some(quokka_core::CoreError::Driver(_)) => exit::QUERY_FAILED,
         _ => exit::USAGE,

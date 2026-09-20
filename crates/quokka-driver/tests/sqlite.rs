@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use quokka_core::{
     execute, AccessMode, Actor, ActorKind, AuditLog, Column, ConnectionConfig, Engine,
-    ExecuteRequest, Outcome, Registry, Row, RowSink, SqlLogging, Status, Value,
+    ExecuteRequest, Outcome, Registry, Row, RowSink, Status, Value,
 };
 
 #[derive(Default)]
@@ -87,24 +87,14 @@ async fn fixture(setup: &[&str]) -> Fixture {
     let audit = AuditLog::open(&audit_db).await.expect("audit log");
     let mut registry = Registry::builtin_only(&audit_db);
     registry.insert(ConnectionConfig {
-        name: "app".to_string(),
-        driver: "sqlite".to_string(),
         path: Some(app_db.clone()),
         mode: AccessMode::ReadWrite,
-        sql_logging: SqlLogging::Fingerprint,
-        database: None,
-        schema: None,
-        builtin: false,
+        ..ConnectionConfig::new("app", "sqlite")
     });
     registry.insert(ConnectionConfig {
-        name: "app-ro".to_string(),
-        driver: "sqlite".to_string(),
         path: Some(app_db),
         mode: AccessMode::ReadOnly,
-        sql_logging: SqlLogging::Fingerprint,
-        database: None,
-        schema: None,
-        builtin: false,
+        ..ConnectionConfig::new("app-ro", "sqlite")
     });
 
     Fixture {
@@ -247,14 +237,9 @@ async fn a_missing_database_file_is_an_error_not_a_new_database() {
 
     let mut registry = Registry::builtin_only(&audit_db);
     registry.insert(ConnectionConfig {
-        name: "typo".to_string(),
-        driver: "sqlite".to_string(),
         path: Some(dir.path().join("does-not-exist.db")),
         mode: AccessMode::ReadWrite,
-        sql_logging: SqlLogging::Fingerprint,
-        database: None,
-        schema: None,
-        builtin: false,
+        ..ConnectionConfig::new("typo", "sqlite")
     });
 
     let engine = Engine::new(registry, audit, quokka_driver::builtin_factories());
@@ -348,4 +333,205 @@ async fn the_audit_connection_is_queryable_like_any_other() {
         .expect("events");
     assert_eq!(own.len(), 2);
     assert_eq!(own[0].event.connection, quokka_core::AUDIT_CONNECTION);
+}
+
+// --- M1 -----------------------------------------------------------------------------
+
+impl Fixture {
+    async fn run_with_params(
+        &self,
+        connection: &str,
+        sql: &str,
+        params: Vec<Value>,
+    ) -> (Outcome, Collect) {
+        let mut sink = Collect::default();
+        let mut request = ExecuteRequest::new(
+            connection,
+            sql,
+            Actor {
+                kind: ActorKind::Human,
+                id: "tester".to_string(),
+            },
+        );
+        request.max_rows = u64::MAX;
+        request.params = params;
+        let outcome = execute(&self.engine, request, &mut sink)
+            .await
+            .expect("execute should report the outcome, not fail");
+        (outcome, sink)
+    }
+
+    async fn catalog(&self, connection: &str, table: Option<&str>) -> quokka_core::CatalogResult {
+        quokka_core::introspect(
+            &self.engine,
+            quokka_core::IntrospectRequest::new(
+                connection,
+                quokka_core::Scope {
+                    table: table.map(str::to_string),
+                    ..quokka_core::Scope::default()
+                },
+                Actor {
+                    kind: ActorKind::Human,
+                    id: "tester".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("introspect")
+    }
+}
+
+/// The SQLite driver refused bound parameters at M0, because `params` has to reach the
+/// audit log under the connection's `sql_logging` mode and that plumbing did not exist.
+/// It does now, so every `Value` has to make the round trip.
+#[tokio::test]
+async fn every_value_binds_and_comes_back_unchanged() {
+    let f = fixture(&["CREATE TABLE t (a)"]).await;
+
+    let params = vec![
+        Value::Int(42),
+        Value::Float(2.5),
+        Value::Text("hello".to_string()),
+        Value::Blob(vec![0x00, 0xff, 0x10]),
+        Value::Bool(true),
+    ];
+    let (outcome, sink) = f
+        .run_with_params("app", "SELECT ?, ?, ?, ?, ?", params.clone())
+        .await;
+
+    assert_eq!(outcome.status, Status::Ok, "{:?}", outcome.error_message);
+    assert_eq!(
+        sink.rows[0].0,
+        vec![
+            Value::Int(42),
+            Value::Float(2.5),
+            Value::Text("hello".to_string()),
+            Value::Blob(vec![0x00, 0xff, 0x10]),
+            // SQLite has no boolean storage class; a bound `true` is stored and read
+            // back as 1, which is the database's answer rather than a lossy one.
+            Value::Int(1),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_bound_null_is_null_and_not_the_string_null() {
+    let f = fixture(&["CREATE TABLE t (a)", "INSERT INTO t VALUES (NULL), (1)"]).await;
+
+    let (_, sink) = f
+        .run_with_params(
+            "app",
+            "SELECT count(*) FROM t WHERE a IS ?",
+            vec![Value::Null],
+        )
+        .await;
+    assert_eq!(sink.rows[0].0[0], Value::Int(1));
+}
+
+/// A parameter is only honestly bound if it cannot be confused with the SQL around it.
+#[tokio::test]
+async fn a_parameter_is_a_value_and_never_becomes_sql() {
+    let f = fixture(&[
+        "CREATE TABLE t (name TEXT)",
+        "INSERT INTO t VALUES ('alice'), ('bob')",
+    ])
+    .await;
+
+    let (outcome, sink) = f
+        .run_with_params(
+            "app",
+            "SELECT count(*) FROM t WHERE name = ?",
+            vec![Value::Text("' OR 1=1 --".to_string())],
+        )
+        .await;
+
+    assert_eq!(outcome.status, Status::Ok);
+    assert_eq!(
+        sink.rows[0].0[0],
+        Value::Int(0),
+        "the value was interpolated into the statement rather than bound to it"
+    );
+}
+
+#[tokio::test]
+async fn introspection_reports_tables_views_and_their_column_types() {
+    let f = fixture(&[
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, email TEXT NOT NULL, total REAL)",
+        "CREATE VIEW big AS SELECT * FROM orders WHERE total > 5",
+        "CREATE TABLE empty_columns (x)",
+    ])
+    .await;
+
+    let all = f.catalog("app", None).await;
+    assert!(!all.from_cache);
+    let names: Vec<&str> = all.catalog.tables.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, ["big", "empty_columns", "orders"]);
+    assert_eq!(all.catalog.tables[0].kind, "view");
+
+    let one = f.catalog("app", Some("orders")).await;
+    assert_eq!(one.catalog.tables.len(), 1);
+    let orders = &one.catalog.tables[0];
+    assert_eq!(orders.kind, "table");
+    assert_eq!(
+        orders
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.driver_type.as_str(), c.nullable))
+            .collect::<Vec<_>>(),
+        [
+            ("id", "INTEGER", Some(true)),
+            ("email", "TEXT", Some(false)),
+            ("total", "REAL", Some(true)),
+        ]
+    );
+
+    // SQLite's internal tables are not part of anybody's schema.
+    assert!(!names.iter().any(|n| n.starts_with("sqlite_")));
+}
+
+/// Invariant 10 on the driver M0 shipped, restated now that two more implement it: an
+/// unrecognized declared type renders as a string rather than aborting the result set.
+#[tokio::test]
+async fn an_unrecognized_declared_type_renders_as_text() {
+    let f = fixture(&[
+        "CREATE TABLE odd (a WIBBLE, b GEOMETRY, c JSONB, d DECIMAL(10,2))",
+        "INSERT INTO odd VALUES ('x', 'POINT(1 2)', '{\"k\":1}', '9.99')",
+    ])
+    .await;
+
+    let (outcome, sink) = f.run("app", "SELECT a, b, c, d FROM odd").await;
+    assert_eq!(outcome.status, Status::Ok, "{:?}", outcome.error_message);
+    assert_eq!(sink.rows.len(), 1, "the result set was not aborted");
+
+    for value in &sink.rows[0].0[..3] {
+        assert!(
+            matches!(value, Value::Text(_)),
+            "an unknown type must degrade to text: {value:?}"
+        );
+    }
+    // `DECIMAL(10,2)` is the exception that shows what SQLite's declared types are: an
+    // affinity, not a type. NUMERIC affinity means the string really was stored as a
+    // real, so `Float(9.99)` is the database's own answer rather than a guess of ours.
+    // Postgres and MySQL, where DECIMAL is exact, deliberately keep it as text.
+    assert_eq!(sink.rows[0].0[3], Value::Float(9.99));
+}
+
+/// `@audit` stays SQLite and read-only however many drivers exist.
+#[tokio::test]
+async fn the_audit_connection_is_still_sqlite_and_read_only() {
+    let f = fixture(&["CREATE TABLE t (a INTEGER)"]).await;
+    let audit = f
+        .engine
+        .registry()
+        .get(quokka_core::AUDIT_CONNECTION)
+        .expect("@audit is built in");
+
+    assert_eq!(audit.driver, "sqlite");
+    assert_eq!(audit.mode, AccessMode::ReadOnly);
+    assert!(audit.builtin);
+    assert_eq!(
+        audit.credential,
+        quokka_core::CredentialRef::None,
+        "it has nothing to authenticate to, so it looks nothing up"
+    );
 }

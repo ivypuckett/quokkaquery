@@ -1,9 +1,14 @@
 //! QuokkaQuery's drivers.
 //!
 //! One module and one cargo feature per database (ARCHITECTURE §3.0, hedge 2), so a
-//! slim build is possible and the `trait Driver` seam stays honest. M0 ships SQLite;
-//! Postgres and MySQL arrive at M1 and Athena at M5, each as its own module and feature
-//! rather than as a branch inside this one.
+//! slim build is possible and the `trait Driver` seam stays honest. M0 shipped SQLite;
+//! M1 adds Postgres and MySQL and Athena arrives at M5 — each its own module and its own
+//! feature rather than a branch inside this one.
+//!
+//! Postgres and MySQL are pure Rust wire-protocol implementations over sqlx with
+//! `rustls`. SQLite is the exception §3.1 names: `sqlx-sqlite` binds `libsqlite3-sys`,
+//! so "pure Rust" is a claim about two of the three. `libmysqlclient` is never linked —
+//! it is GPLv2 and this project is MIT.
 //!
 //! `trait Driver` itself is declared in `quokka-core` — see the note at the top of
 //! `quokka_core::driver` for why — and re-exported here, so `quokka_driver::Driver`
@@ -16,9 +21,19 @@ use std::sync::Arc;
 
 pub use quokka_core::{Driver, DriverFactory};
 
+mod common;
+
+#[cfg(feature = "mysql")]
+pub mod mysql;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "mysql")]
+pub use mysql::MySqlDriver;
+#[cfg(feature = "postgres")]
+pub use postgres::PostgresDriver;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteDriver;
 
@@ -36,5 +51,9 @@ pub fn builtin_factories() -> Vec<Arc<dyn DriverFactory>> {
     let mut factories: Vec<Arc<dyn DriverFactory>> = Vec::new();
     #[cfg(feature = "sqlite")]
     factories.push(Arc::new(sqlite::SqliteFactory));
+    #[cfg(feature = "postgres")]
+    factories.push(Arc::new(postgres::PostgresFactory));
+    #[cfg(feature = "mysql")]
+    factories.push(Arc::new(mysql::MySqlFactory));
     factories
 }
