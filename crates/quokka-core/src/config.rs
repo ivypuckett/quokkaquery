@@ -26,6 +26,15 @@ pub const AUDIT_CONNECTION: &str = "@audit";
 /// the log, because nothing reached a database (§5).
 pub const DEFAULT_CATALOG_TTL: Duration = Duration::from_secs(60);
 
+/// How long a connection attempt may keep trying before it is called a failure.
+///
+/// sqlx's pool retries a refused or unreachable server until its acquire timeout, which
+/// defaults to thirty seconds. That is sensible for a long-lived service riding out a
+/// restart and wrong for a CLI: a typo in `host` should be a message, not half a minute
+/// of silence. Ten seconds is long enough to cross a slow VPN and short enough to feel
+/// like an answer.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// What TLS the driver asks for on a network connection.
 ///
 /// The names are libpq's, because that is the vocabulary anyone configuring a Postgres
@@ -115,6 +124,8 @@ pub struct ConnectionConfig {
     pub schema: Option<String>,
     /// How long a catalog refresh stays fresh (§3.1).
     pub catalog_ttl: Duration,
+    /// How long to keep trying to connect before reporting a failure.
+    pub connect_timeout: Duration,
     /// True for `@audit`, which the registry supplies rather than the config file.
     pub builtin: bool,
 }
@@ -143,6 +154,7 @@ impl ConnectionConfig {
             database: None,
             schema: None,
             catalog_ttl: DEFAULT_CATALOG_TTL,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             builtin: false,
         }
     }
@@ -224,6 +236,9 @@ struct ConnectionFile {
     /// `"60s"`, `"5m"`, `"0"` to cache nothing.
     #[serde(default)]
     catalog_ttl: Option<String>,
+    /// `"10s"` by default.
+    #[serde(default)]
+    connect_timeout: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -312,6 +327,15 @@ impl Registry {
                     })?,
                     None => DEFAULT_CATALOG_TTL,
                 };
+                let connect_timeout = match &c.connect_timeout {
+                    Some(text) => parse_duration(text).ok_or_else(|| {
+                        bad(format!(
+                            "connect_timeout {text:?} is not a duration; write it as \"10s\" \
+                             or \"1m\""
+                        ))
+                    })?,
+                    None => DEFAULT_CONNECT_TIMEOUT,
+                };
 
                 let cfg = ConnectionConfig {
                     name: name.clone(),
@@ -327,6 +351,7 @@ impl Registry {
                     database: c.database,
                     schema: c.schema,
                     catalog_ttl,
+                    connect_timeout,
                     builtin: false,
                 };
                 if let Err(detail) = check(&cfg) {
@@ -392,6 +417,7 @@ fn audit_connection(audit_db: &Path) -> ConnectionConfig {
         database: Some("audit".to_string()),
         schema: None,
         catalog_ttl: DEFAULT_CATALOG_TTL,
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         builtin: true,
     }
 }

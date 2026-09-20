@@ -131,6 +131,9 @@ impl Driver for PostgresDriver {
 
         let pool = PgPoolOptions::new()
             .max_connections(4)
+            // Otherwise a typo in `host` is thirty seconds of silence rather than a
+            // message: sqlx's pool keeps retrying a refused server until this expires.
+            .acquire_timeout(cfg.connect_timeout)
             .connect_with(opts)
             .await
             .map_err(|e| connect_error(cfg, e))?;

@@ -107,7 +107,9 @@ impl Driver for MySqlDriver {
             opts = opts.password(secret.expose());
         }
 
-        let mut pool = MySqlPoolOptions::new().max_connections(4);
+        let mut pool = MySqlPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(cfg.connect_timeout);
         if cfg.mode.is_read_only() {
             // Invariant 9 one layer below the policy engine, as in the Postgres driver —
             // except that MySQL has no startup parameter for it, so it costs one

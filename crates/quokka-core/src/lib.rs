@@ -21,7 +21,7 @@ pub mod value;
 pub use catalog::CatalogCache;
 pub use config::{
     default_config_path, default_port, dialect_hint, AccessMode, ConnectionConfig, Registry,
-    TlsMode, AUDIT_CONNECTION, DEFAULT_CATALOG_TTL,
+    TlsMode, AUDIT_CONNECTION, DEFAULT_CATALOG_TTL, DEFAULT_CONNECT_TIMEOUT,
 };
 pub use credential::{Backend as CredentialBackend, CredentialError, CredentialRef};
 pub use driver::{

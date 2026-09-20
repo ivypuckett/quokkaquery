@@ -29,12 +29,17 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all --check
 
-      # --all-targets so tests and examples are linted too, not just the libraries.
+      # --all-targets so tests and examples are linted too, not just the libraries, and
+      # --all-features so the container-backed tests are compiled and linted here even
+      # though they are run in the `containers` job below.
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # Deliberately *not* --all-features: that would switch on quokka-driver's
+      # `docker-tests`, and CLAUDE.md says the default `cargo test` must pass with no
+      # Docker. Every driver is still built, because the CLI depends on all three.
       - name: cargo test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
 
   platforms:
     name: test (${{ matrix.os }})
@@ -51,7 +56,27 @@ jobs:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
+
+  containers:
+    name: container-backed driver tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # ARCHITECTURE §9: Postgres and MySQL are tested against real servers via
+      # testcontainers, behind a feature so the jobs above need no Docker. This is the
+      # one place the wire-protocol drivers meet a real server — whether an hstore
+      # degrades to a string rather than aborting a result set, whether
+      # `default_transaction_read_only` actually refuses a write, whether a rejected
+      # password stays out of the error text. None of those can be checked against a
+      # fake, so if this job stops running, the drivers stop being tested.
+      #
+      # Docker is preinstalled on the GitHub-hosted ubuntu runners, so there is nothing
+      # to set up here.
+      - name: cargo test --features docker-tests
+        run: cargo test --package quokka-driver --features docker-tests
 
   headless:
     name: headless build has no GUI dependencies
@@ -80,6 +105,21 @@ jobs:
 
       - name: the headless binary runs
         run: cargo run --package quokkaquery --no-default-features -- --version
+
+      # The drivers are not behind a CLI feature, so the headless build is a full
+      # database client rather than a SQLite-only one. Checking it here keeps that a
+      # decision rather than an accident.
+      - name: the headless build still carries every driver
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --package quokkaquery --no-default-features --edges normal)
+          for driver in sqlite postgres mysql; do
+            if ! echo "$tree" | grep -q "sqlx-$driver"; then
+              echo "::error::the headless build dropped the $driver driver"
+              exit 1
+            fi
+          done
+          echo "headless tree carries sqlite, postgres and mysql"
 
   msrv:
     name: builds on the declared rust-version
