@@ -4,6 +4,7 @@ members = [
     "crates/quokka-core",
     "crates/quokka-driver",
     "crates/quokka-audit",
+    "crates/quokka-spool",
     "crates/quokka-cli",
 ]
 
@@ -20,6 +21,7 @@ authors = ["QuokkaQuery contributors"]
 quokka-core = { path = "crates/quokka-core", version = "0.0.1" }
 quokka-driver = { path = "crates/quokka-driver", version = "0.0.1" }
 quokka-audit = { path = "crates/quokka-audit", version = "0.0.1" }
+quokka-spool = { path = "crates/quokka-spool", version = "0.0.1" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -58,6 +60,13 @@ chacha20poly1305 = "0.11"
 getrandom = "0.4"
 rpassword = "7"
 zeroize = "1"
+
+# Parquet export (§4), behind quokka-spool's default-on `parquet` feature. Default
+# features are off so the `zstd` and `lz4` codecs — which are C bindings — stay out of
+# the tree; `snap` is pure Rust, and everything here is Apache-2.0 or BSD-3-Clause.
+arrow-array = { version = "56", default-features = false }
+arrow-schema = { version = "56", default-features = false }
+parquet = { version = "56", default-features = false, features = ["arrow", "snap"] }
 
 tempfile = "3"
 # Container-backed tests only (§9), behind quokka-driver's `docker-tests` feature.

@@ -438,3 +438,84 @@ async fn full_logging_keeps_the_text_but_still_scrubs_secrets() {
         "the text lives on the start event only"
     );
 }
+
+/// A sink that keeps nothing leaves `rows_spooled` NULL rather than claiming a cache
+/// that does not exist, and a sink that keeps rows has its answer carried into the
+/// outcome and into the log (§5).
+#[tokio::test]
+async fn the_log_records_what_the_sink_kept_and_nothing_more() {
+    // The default `retained()` — a formatter writing to stdout.
+    let h = harness(Behaviour::Rows(3)).await;
+    let outcome = execute(&h.engine, request("SELECT 1"), &mut NullSink)
+        .await
+        .expect("execute");
+    assert_eq!(outcome.rows_returned, 3);
+    assert_eq!(outcome.rows_spooled, None);
+    assert_eq!(outcome.spool_capped, None);
+    assert!(!outcome.is_partial());
+
+    let finished = quokka_core::events_for_query(&h.engine, outcome.query_id)
+        .await
+        .expect("read the log")
+        .into_iter()
+        .find(|e| e.event.event_kind == EventKind::QueryFinished)
+        .expect("a finish event");
+    assert_eq!(finished.event.rows_returned, Some(3));
+    assert_eq!(
+        finished.event.rows_spooled, None,
+        "a sink that caches nothing must not claim a spool"
+    );
+
+    // A sink that does keep rows, and stops keeping them part way through.
+    struct Caching {
+        kept: u64,
+        room: u64,
+    }
+    impl RowSink for Caching {
+        fn begin(&mut self, _columns: &[Column]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn row(&mut self, _row: &Row) -> std::io::Result<()> {
+            // Full is not an error: the rows keep arriving and the cache stops growing.
+            if self.kept < self.room {
+                self.kept += 1;
+            }
+            Ok(())
+        }
+        fn end(&mut self, _outcome: &Outcome) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn retained(&self) -> Option<quokka_core::Retained> {
+            Some(quokka_core::Retained {
+                rows: self.kept,
+                capped: (self.kept >= self.room).then_some(quokka_core::Cap::Rows),
+            })
+        }
+    }
+
+    let h = harness(Behaviour::Rows(5)).await;
+    let mut sink = Caching { kept: 0, room: 2 };
+    let outcome = execute(&h.engine, request("SELECT 1"), &mut sink)
+        .await
+        .expect("execute");
+
+    assert_eq!(outcome.rows_returned, 5);
+    assert_eq!(outcome.rows_spooled, Some(2));
+    assert_eq!(outcome.spool_capped, Some(quokka_core::Cap::Rows));
+    // The caller's cap never fired, and the result is still partial — which is what
+    // §4.2 means by "marked truncated" on hitting the spool cap.
+    assert!(!outcome.truncated);
+    assert!(outcome.is_partial());
+
+    let finished = quokka_core::events_for_query(&h.engine, outcome.query_id)
+        .await
+        .expect("read the log")
+        .into_iter()
+        .find(|e| e.event.event_kind == EventKind::QueryFinished)
+        .expect("a finish event");
+    assert_eq!(finished.event.truncated, Some(true));
+    // The two caps stay apart in the log without a column of their own: fewer spooled
+    // than returned is the spool's cap, equal is the caller's.
+    assert_eq!(finished.event.rows_returned, Some(5));
+    assert_eq!(finished.event.rows_spooled, Some(2));
+}

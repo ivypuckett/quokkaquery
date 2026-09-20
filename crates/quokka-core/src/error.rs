@@ -85,6 +85,19 @@ pub enum CoreError {
         source: quokka_audit::AuditError,
     },
 
+    /// §5 again: an export is a logged event even though it touched no database, so a
+    /// failed append means a file exists that the log does not mention. The file is
+    /// already written by the time this can be raised, so — like a failed
+    /// `query_finished` — it is surfaced loudly rather than swallowed.
+    #[error(
+        "the export was written but the audit log could not record it ({source}). \
+         The file exists and the log does not say so."
+    )]
+    ExportNotRecorded {
+        #[source]
+        source: quokka_audit::AuditError,
+    },
+
     #[error(transparent)]
     Credential(#[from] crate::credential::CredentialError),
 
