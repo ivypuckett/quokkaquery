@@ -68,6 +68,19 @@ impl Workspace {
         self.dir.path().join("audit.db")
     }
 
+    /// The same connections, with the spool capped at one row — the config a test uses
+    /// to make the spool's own cap bind before anything else does (§4.2).
+    fn spool_capped_config(&self) -> std::path::PathBuf {
+        let path = self.dir.path().join("config-tight.toml");
+        if !path.exists() {
+            let base =
+                std::fs::read_to_string(self.dir.path().join("config.toml")).expect("config");
+            std::fs::write(&path, format!("{base}\n[spool]\nmax_rows = 1\n"))
+                .expect("tight config");
+        }
+        path
+    }
+
     fn quokka(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_quokka"))
             .args(args)
@@ -85,6 +98,9 @@ impl Workspace {
                 "QUOKKA_CREDENTIAL_FILE",
                 self.dir.path().join("credentials.enc"),
             )
+            // Spools live under the cache directory (§4.1), and a test must never write
+            // to the developer's real one.
+            .env("QUOKKA_CACHE_DIR", self.dir.path().join("cache"))
             .output()
             .expect("run quokka")
     }
@@ -677,4 +693,457 @@ fn query_log(w: &Workspace, connection: &str) -> Vec<Json> {
              WHERE event_kind = 'query_started' AND connection = '{connection}'"
         ),
     )
+}
+
+/// Everything in the audit database, as raw bytes.
+///
+/// Not a query: invariant 4 is about what is *in the file*, so the check reads the file
+/// — the write-ahead log beside it included, because a row that has not been
+/// checkpointed yet is still a row that reached the log.
+fn audit_bytes(w: &Workspace) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = w.audit_db().with_file_name(format!("audit.db{suffix}"));
+        if let Ok(mut content) = std::fs::read(&path) {
+            bytes.append(&mut content);
+        }
+    }
+    bytes
+}
+
+/// The one-invocation export of §4.1 and §6.1: the file is written, and the log holds a
+/// `query_finished` plus an `export` linked to it by `parent_id`.
+#[tokio::test]
+async fn a_query_exports_in_one_invocation_and_the_export_is_its_own_audited_event() {
+    let w = Workspace::new().await;
+    let file = w.dir.path().join("orders.parquet");
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--export",
+        file.to_str().expect("path"),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(file.exists(), "no file was written");
+    assert!(std::fs::metadata(&file).expect("metadata").len() > 0);
+
+    // The summary of the export goes to stderr for the machine formats, so stdout stays
+    // exactly one envelope.
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("one JSON envelope");
+    let query_id = envelope["query_id"].as_str().expect("query_id").to_string();
+    let summary: Json = serde_json::from_str(stderr(&out).trim()).expect("export summary");
+    assert_eq!(summary["rows"], 2);
+    assert_eq!(summary["format"], "parquet");
+    assert_eq!(summary["whole_result"], true);
+
+    let events = audit_rows(
+        &w,
+        &format!(
+            "SELECT event_kind, status, rows_returned, rows_spooled, truncated, \
+                    export_format, export_path, parent_id \
+             FROM audit_log WHERE query_id = '{query_id}' OR parent_id = '{query_id}' \
+             ORDER BY id"
+        ),
+    );
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e["event_kind"].as_str().expect("event_kind"))
+        .collect();
+    assert_eq!(kinds, ["query_started", "query_finished", "export"]);
+
+    let finished = &events[1];
+    assert_eq!(finished["rows_returned"], 2);
+    // The rows were spooled, which is what made the export a read rather than a re-run.
+    assert_eq!(finished["rows_spooled"], 2);
+
+    let export = &events[2];
+    assert_eq!(export["status"], "ok");
+    assert_eq!(export["export_format"], "parquet");
+    assert_eq!(export["rows_returned"], 2);
+    assert_eq!(export["truncated"], 0);
+    assert_eq!(
+        export["parent_id"].as_str(),
+        Some(query_id.as_str()),
+        "an export links to the query that produced it (§5)"
+    );
+
+    // And the chain still verifies with the new event kind in it.
+    let verify = w.quokka(&["audit", "verify"]);
+    assert_eq!(code(&verify), 0, "{}", stdout(&verify));
+}
+
+/// Invariant 4, after the operation most likely to break it: no row, sample or digest of
+/// a row reaches the log, even when ten million of them were just written to a file.
+#[tokio::test]
+async fn no_result_data_reaches_the_log_after_an_export() {
+    let w = Workspace::new().await;
+    // A value that exists nowhere else in the world, planted in the data rather than in
+    // the SQL — the connection logs fingerprints, so a literal in the query would be a
+    // different story from a value in a result.
+    const NEEDLE: &str = "zzq-needle-9f3a1c7e-do-not-log";
+    let seed = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "INSERT INTO orders (id, email, total) VALUES (99, ?, 1.0)",
+        "--param",
+        &format!("text:{NEEDLE}"),
+    ]);
+    assert_eq!(code(&seed), 0, "stderr: {}", stderr(&seed));
+
+    let csv = w.dir.path().join("out.csv");
+    let json = w.dir.path().join("out.json");
+    for (path, format) in [(&csv, "csv"), (&json, "json")] {
+        let out = w.quokka(&[
+            "query",
+            "--connection",
+            "app",
+            "SELECT * FROM orders",
+            "--export",
+            path.to_str().expect("path"),
+            "--export-format",
+            format,
+        ]);
+        assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    }
+
+    // The needle is in both files, so the export really did carry it.
+    assert!(std::fs::read_to_string(&csv).expect("csv").contains(NEEDLE));
+    assert!(std::fs::read_to_string(&json)
+        .expect("json")
+        .contains(NEEDLE));
+
+    // And nowhere in the log. Bytes, not rows: a digest or a sample hidden in any
+    // column would still be in the file.
+    let bytes = audit_bytes(&w);
+    let found = bytes.windows(NEEDLE.len()).any(|w| w == NEEDLE.as_bytes());
+    assert!(
+        !found,
+        "a value from a result reached the audit log — invariant 4"
+    );
+}
+
+/// §4.1 and §1.4 together: exporting by id costs a second scan, so without --rerun it
+/// does not happen — and *nothing* happens, not even a lookup.
+#[tokio::test]
+async fn export_by_id_without_rerun_runs_nothing_at_all() {
+    let w = Workspace::new().await;
+
+    let first = w.quokka(&[
+        "query",
+        "--connection",
+        "app-full",
+        "SELECT * FROM orders",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&first), 0, "stderr: {}", stderr(&first));
+    let envelope: Json = serde_json::from_str(&stdout(&first)).expect("envelope");
+    let query_id = envelope["query_id"].as_str().expect("query_id").to_string();
+
+    let before = audit_rows(&w, "SELECT id FROM audit_log").len();
+    let file = w.dir.path().join("late.csv");
+
+    let refused = w.quokka(&[
+        "export",
+        "--query-id",
+        &query_id,
+        "-o",
+        file.to_str().expect("path"),
+    ]);
+    assert_eq!(code(&refused), 2, "stdout: {}", stdout(&refused));
+    let message = stderr(&refused);
+    assert!(message.contains("--rerun"), "{message}");
+    assert!(message.contains("second scan"), "{message}");
+    assert!(!file.exists(), "a file was written without --rerun");
+
+    // The strong form: the log is unchanged. Not "it exited non-zero" — nothing ran.
+    // (`audit_rows` is itself a query, so the count it reports afterwards includes the
+    // events of the reading query. Comparing counts taken the same way is the point.)
+    let after = audit_rows(&w, "SELECT id FROM audit_log").len();
+    assert_eq!(
+        after - before,
+        2,
+        "the refusal should leave the log holding only the two events of the query that \
+         read it"
+    );
+}
+
+/// The other half: --rerun works, is logged as a new query linked to the first, and is
+/// refused outright where the log kept only a fingerprint.
+#[tokio::test]
+async fn rerun_needs_full_sql_logging_and_links_back_to_the_original() {
+    let w = Workspace::new().await;
+
+    // `app-full` logs the query verbatim, so the text to re-run exists.
+    let first = w.quokka(&[
+        "query",
+        "--connection",
+        "app-full",
+        "SELECT * FROM orders",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&first), 0, "stderr: {}", stderr(&first));
+    let full_id = serde_json::from_str::<Json>(&stdout(&first)).expect("envelope")["query_id"]
+        .as_str()
+        .expect("query_id")
+        .to_string();
+
+    let file = w.dir.path().join("again.csv");
+    let out = w.quokka(&[
+        "export",
+        "--query-id",
+        &full_id,
+        "--rerun",
+        "-o",
+        file.to_str().expect("path"),
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    assert!(file.exists());
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("csv").lines().count(),
+        3,
+        "a header and two rows"
+    );
+
+    // The re-run is its own query, and it points at the one being cited (§4.1).
+    let rerun = audit_rows(
+        &w,
+        &format!(
+            "SELECT query_id, event_kind FROM audit_log \
+             WHERE parent_id = '{full_id}' AND event_kind = 'query_started'"
+        ),
+    );
+    assert_eq!(
+        rerun.len(),
+        1,
+        "the re-run should link back to the original"
+    );
+
+    // `app` logs fingerprints, which is the default, so the text was never written down.
+    let fingerprinted = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--format",
+        "json",
+    ]);
+    let short_id = serde_json::from_str::<Json>(&stdout(&fingerprinted)).expect("envelope")
+        ["query_id"]
+        .as_str()
+        .expect("query_id")
+        .to_string();
+
+    let refused = w.quokka(&[
+        "export",
+        "--query-id",
+        &short_id,
+        "--rerun",
+        "-o",
+        w.dir.path().join("never.csv").to_str().expect("path"),
+    ]);
+    assert_eq!(code(&refused), 2);
+    let message = stderr(&refused);
+    assert!(message.contains("fingerprint"), "{message}");
+    assert!(message.contains("sql_logging"), "{message}");
+    assert!(
+        !w.dir.path().join("never.csv").exists(),
+        "a fingerprint was turned into SQL and run"
+    );
+}
+
+/// The spool's own cap and `--max-rows` are different things, say so differently, and
+/// stay apart in the log.
+#[tokio::test]
+async fn both_caps_report_truncation_and_the_log_tells_them_apart() {
+    let w = Workspace::new().await;
+
+    // The caller's cap.
+    let capped = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--max-rows",
+        "1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&capped), 0, "stderr: {}", stderr(&capped));
+    let envelope: Json = serde_json::from_str(&stdout(&capped)).expect("envelope");
+    assert_eq!(envelope["truncated"], true);
+    assert_eq!(envelope["rows_spooled"], 1);
+    assert!(envelope.get("spool_capped").is_none());
+
+    // The spool's, via a config that caps it at one row.
+    let tight = w.quokka(&[
+        "--config",
+        w.spool_capped_config().to_str().expect("path"),
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--max-rows",
+        "10",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&tight), 0, "stderr: {}", stderr(&tight));
+    let envelope: Json = serde_json::from_str(&stdout(&tight)).expect("envelope");
+    assert_eq!(envelope["row_count"], 2);
+    assert_eq!(envelope["rows_spooled"], 1);
+    assert_eq!(envelope["spool_capped"], "rows");
+
+    // In the log: both are truncated, and the row counts say which cap it was — equal
+    // for the caller's, fewer spooled than returned for the spool's.
+    let finished = audit_rows(
+        &w,
+        "SELECT rows_returned, rows_spooled, truncated FROM audit_log \
+         WHERE event_kind = 'query_finished' AND connection = 'app' ORDER BY id",
+    );
+    assert_eq!(finished[0]["truncated"], 1);
+    assert_eq!(finished[0]["rows_returned"], finished[0]["rows_spooled"]);
+    assert_eq!(finished[1]["truncated"], 1);
+    assert_eq!(finished[1]["rows_returned"], 2);
+    assert_eq!(finished[1]["rows_spooled"], 1);
+}
+
+/// A table footer must never let a prefix pass for the whole answer (§4.2).
+#[tokio::test]
+async fn the_table_footer_names_the_cap_that_stopped_it() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--max-rows",
+        "1",
+    ]);
+    assert!(
+        stdout(&out).contains("TRUNCATED at --max-rows"),
+        "{}",
+        stdout(&out)
+    );
+
+    let tight = w.quokka(&[
+        "--config",
+        w.spool_capped_config().to_str().expect("path"),
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--max-rows",
+        "10",
+    ]);
+    let text = stdout(&tight);
+    assert!(text.contains("TRUNCATED at the spool's rows cap"), "{text}");
+    assert!(text.contains("1 of 2 rows shown"), "{text}");
+}
+
+/// `--all` streams driver → file with no spool, which is how a dataset larger than
+/// local disk gets out (§4.2) — and why it cannot then be paged.
+#[tokio::test]
+async fn all_streams_past_the_spool_cap_and_spools_nothing() {
+    let w = Workspace::new().await;
+    let file = w.dir.path().join("everything.ndjson");
+
+    let out = w.quokka(&[
+        "--config",
+        w.spool_capped_config().to_str().expect("path"),
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--export",
+        file.to_str().expect("path"),
+        "--all",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+
+    // Both rows reached the file even though the spool would have held one.
+    assert_eq!(
+        std::fs::read_to_string(&file)
+            .expect("ndjson")
+            .lines()
+            .count(),
+        2
+    );
+
+    // And nothing was spooled, so the log does not claim rows that can be paged.
+    let finished = audit_rows(
+        &w,
+        "SELECT rows_returned, rows_spooled FROM audit_log \
+         WHERE event_kind = 'query_finished' AND connection = 'app' ORDER BY id DESC LIMIT 1",
+    );
+    assert_eq!(finished[0]["rows_returned"], 2);
+    assert!(finished[0]["rows_spooled"].is_null());
+
+    // Parquet is refused on this path rather than half-written: its header declares a
+    // type per column, which is not known until the rows have been seen.
+    let refused = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--export",
+        w.dir.path().join("no.parquet").to_str().expect("path"),
+        "--all",
+    ]);
+    assert_ne!(code(&refused), 0);
+    assert!(stderr(&refused).contains("--all"), "{}", stderr(&refused));
+}
+
+/// §4.1: nothing survives the process. The cache directory holds no result between
+/// invocations.
+#[tokio::test]
+async fn the_spool_does_not_outlive_the_invocation() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&["query", "--connection", "app", "SELECT * FROM orders"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+
+    let cache = w.dir.path().join("cache").join("spool");
+    let left: Vec<std::path::PathBuf> = std::fs::read_dir(&cache)
+        .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        left.is_empty(),
+        "the spool outlived the invocation that made it: {left:?}"
+    );
+}
+
+/// `--export -` makes stdout the file, so nothing else may be written there — a line of
+/// prose in the middle of a pipeline is corruption of what was exported.
+#[tokio::test]
+async fn exporting_to_stdout_leaves_stdout_holding_only_the_export() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT id FROM orders ORDER BY id",
+        "--export",
+        "-",
+        "--export-format",
+        "ndjson",
+    ]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines, ["{\"id\":1}", "{\"id\":2}"]);
+    // The summary still happened — on the other stream.
+    assert!(stderr(&out).contains("exported 2 rows"), "{}", stderr(&out));
 }
