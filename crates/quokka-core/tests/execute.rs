@@ -144,14 +144,9 @@ async fn harness_with(behaviour: Behaviour, sql_logging: quokka_core::SqlLogging
     let executions = Arc::new(AtomicUsize::new(0));
     let mut registry = Registry::builtin_only(&audit_path);
     registry.insert(ConnectionConfig {
-        name: "fake".to_string(),
-        driver: "fake".to_string(),
-        path: None,
         mode: quokka_core::AccessMode::ReadWrite,
         sql_logging,
-        database: None,
-        schema: None,
-        builtin: false,
+        ..ConnectionConfig::new("fake", "fake")
     });
 
     let engine = Engine::new(

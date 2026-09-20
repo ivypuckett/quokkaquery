@@ -71,6 +71,23 @@ pub enum CoreError {
         source: quokka_audit::AuditError,
     },
 
+    /// §5: fail-closed does not apply to introspection — there is no "before" event to
+    /// fail — so the refresh has already happened by the time this can be raised. It is
+    /// surfaced loudly rather than swallowed, exactly as a failed `query_finished` is,
+    /// and the catalog is dropped rather than cached: a refresh the log never heard
+    /// about must not go on to answer questions.
+    #[error(
+        "the catalog was refreshed but the audit log could not record it ({source}). \
+         The refresh has been discarded rather than cached."
+    )]
+    IntrospectNotRecorded {
+        #[source]
+        source: quokka_audit::AuditError,
+    },
+
+    #[error(transparent)]
+    Credential(#[from] crate::credential::CredentialError),
+
     #[error("audit log: {0}")]
     Audit(#[from] quokka_audit::AuditError),
 

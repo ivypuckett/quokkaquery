@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use quokka_core::{
     execute, AccessMode, Actor, ActorKind, AuditLog, Column, ConnectionConfig, Engine,
-    ExecuteRequest, Outcome, Registry, Row, RowSink, SqlLogging, Status, Value,
+    ExecuteRequest, Outcome, Registry, Row, RowSink, Status, Value,
 };
 
 #[derive(Default)]
@@ -87,24 +87,14 @@ async fn fixture(setup: &[&str]) -> Fixture {
     let audit = AuditLog::open(&audit_db).await.expect("audit log");
     let mut registry = Registry::builtin_only(&audit_db);
     registry.insert(ConnectionConfig {
-        name: "app".to_string(),
-        driver: "sqlite".to_string(),
         path: Some(app_db.clone()),
         mode: AccessMode::ReadWrite,
-        sql_logging: SqlLogging::Fingerprint,
-        database: None,
-        schema: None,
-        builtin: false,
+        ..ConnectionConfig::new("app", "sqlite")
     });
     registry.insert(ConnectionConfig {
-        name: "app-ro".to_string(),
-        driver: "sqlite".to_string(),
         path: Some(app_db),
         mode: AccessMode::ReadOnly,
-        sql_logging: SqlLogging::Fingerprint,
-        database: None,
-        schema: None,
-        builtin: false,
+        ..ConnectionConfig::new("app-ro", "sqlite")
     });
 
     Fixture {
@@ -247,14 +237,9 @@ async fn a_missing_database_file_is_an_error_not_a_new_database() {
 
     let mut registry = Registry::builtin_only(&audit_db);
     registry.insert(ConnectionConfig {
-        name: "typo".to_string(),
-        driver: "sqlite".to_string(),
         path: Some(dir.path().join("does-not-exist.db")),
         mode: AccessMode::ReadWrite,
-        sql_logging: SqlLogging::Fingerprint,
-        database: None,
-        schema: None,
-        builtin: false,
+        ..ConnectionConfig::new("typo", "sqlite")
     });
 
     let engine = Engine::new(registry, audit, quokka_driver::builtin_factories());
