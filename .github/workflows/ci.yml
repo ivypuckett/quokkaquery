@@ -112,6 +112,34 @@ jobs:
       - name: the headless binary runs
         run: cargo run --package quokkaquery --no-default-features -- --version
 
+      # Parquet export is default-on and asked for by name in the CLI's manifest, so
+      # dropping the CLI's default features must NOT drop it: `--no-default-features`
+      # exists to shed the GUI stack for a container, and a container is where writing
+      # Parquet is most useful. This is the guard on that decision.
+      - name: the headless build still writes parquet
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --package quokkaquery --no-default-features --edges normal)
+          if ! grep -q "parquet" <<<"$tree"; then
+            echo "::error::the headless build lost parquet export"
+            exit 1
+          fi
+          echo "headless tree still carries parquet"
+
+      # And the other half of that decision: arrow stays separable, so a consumer that
+      # only needs CSV can drop ~60 crates. A feature nobody checks stops working.
+      - name: quokka-spool without parquet has no arrow
+        run: |
+          set -euo pipefail
+          cargo build --package quokka-spool --no-default-features
+          tree=$(cargo tree --package quokka-spool --no-default-features --edges normal)
+          if grep -Eiq '\b(arrow|arrow-array|arrow-schema|parquet|thrift)\b' <<<"$tree"; then
+            echo "::error::arrow reached a build that switched parquet off:"
+            grep -Ei '\b(arrow|arrow-array|arrow-schema|parquet|thrift)\b' <<<"$tree"
+            exit 1
+          fi
+          echo "the no-parquet spool tree is clean"
+
       # The drivers are not behind a CLI feature, so the headless build is a full
       # database client rather than a SQLite-only one. Checking it here keeps that a
       # decision rather than an accident.
