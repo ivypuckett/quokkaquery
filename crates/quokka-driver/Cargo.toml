@@ -1,0 +1,28 @@
+[package]
+name = "quokka-driver"
+description = "QuokkaQuery drivers: the Driver trait's implementations, one cargo feature per database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+
+[dependencies]
+quokka-core.workspace = true
+
+async-trait.workspace = true
+futures.workspace = true
+sqlx = { workspace = true, default-features = false, features = ["runtime-tokio"] }
+tokio = { workspace = true }
+uuid.workspace = true
+
+[dev-dependencies]
+quokka-audit.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
