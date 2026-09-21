@@ -976,6 +976,11 @@ async fn run_query(
 ) -> Result<Partial, RunFailure> {
     // A deadline rather than a timer per step: the budget is for the statement, not for
     // each row, so a query that trickles a row a second does not get to run forever.
+    //
+    // Started before the connection is opened, because the caller asked how long this
+    // call may take. Opening is not itself raced against it — an unreachable host is
+    // `connect_timeout`'s business, which is a different setting answering a different
+    // question — but the time it takes is spent out of this budget.
     let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
 
     let driver = engine
