@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::params::{direction_name, value_from_json, view_for, FilterSpec, SortSpec};
-use crate::state::{Held, Results};
+use crate::state::{release, Held, Results, MAX_HELD_RESULTS};
 
 /// How many rows an MCP `query` reads from the database when nothing says otherwise.
 ///
@@ -478,7 +478,9 @@ impl QuokkaMcp {
         let query_id = outcome.query_id;
         let mut held = Held::new(spool, outcome);
         held.view = view;
-        self.results.insert(query_id, held);
+        if let Some(evicted) = self.results.insert(query_id, held) {
+            release(evicted).await;
+        }
 
         self.page(query_id, None, args.limit).await
     }
@@ -693,10 +695,11 @@ fn parse_uuid(text: &str) -> Result<Uuid, McpError> {
 fn unknown_result(query_id: Uuid) -> McpError {
     McpError::invalid_params(
         format!(
-            "this server is not holding a result for query {query_id}. Results live as \
-             long as the server process and no longer (§4.1), and re-reading one means \
-             running the query again — which costs a second scan, so it does not happen \
-             by itself. Run it again with `sql` if you want fresh rows."
+            "this server is not holding a result for query {query_id}. Results do not \
+             outlive the server process (§4.1), and only the {MAX_HELD_RESULTS} most \
+             recent are kept. Getting these rows back means running the query again — \
+             which costs a second scan, so it does not happen by itself. Run it again \
+             with `sql` if you want fresh rows."
         ),
         None,
     )

@@ -37,6 +37,7 @@ use rmcp::transport::stdio;
 use rmcp::ServiceExt;
 
 pub use server::{QuokkaMcp, DEFAULT_FETCH_ROWS};
+pub use state::MAX_HELD_RESULTS;
 
 /// Errors from running the server itself, as distinct from anything a tool answered.
 #[derive(Debug, thiserror::Error)]

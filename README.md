@@ -136,6 +136,12 @@ Responses are hard-capped at 512 rows; `scope_note` is on every page that holds 
 rather than a whole result, because an agent handed the top of a truncated cache as
 though it were the top of the result will not notice.
 
+The server keeps the 32 most recent results open and releases the oldest past that — a
+bound the CLI never needed, since a spool died with the invocation that made it, and one a
+server does, or "long-lived" would mean "grows until the disk does". A result that has
+been released is not a silent empty page: the call naming it is told the rows are gone and
+that getting them back means running the query again.
+
 **The agent sees every connection the CLI does.** Hiding one would be a second, weaker
 guardrail competing with the real one: a connection an agent cannot see is a connection
 it cannot reach, the name leaks through the first error message that mentions it, and a

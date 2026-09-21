@@ -61,20 +61,52 @@ impl Held {
     }
 }
 
-/// Every result this process is still holding.
+/// How many finished results the server keeps open at once.
+///
+/// There has to be a number. The CLI never needed one — a spool died with the
+/// invocation that made it — but a server that ran four hundred queries would otherwise
+/// hold four hundred SQLite files open and up to the spool cap of disk for each, and
+/// "long-lived" would mean "grows until the disk does not". Thirty-two is enough that an
+/// agent working through a result set, exporting it and comparing it with another never
+/// notices, and small enough that the bound is real.
+///
+/// Losing a result is not a silent failure: the next call naming it is told that the
+/// rows are gone and that getting them back means running the query again — which costs
+/// a second scan, so it does not happen by itself (§1.4).
+pub const MAX_HELD_RESULTS: usize = 32;
+
+/// Every result this process is still holding, oldest first.
 #[derive(Clone, Default)]
-pub struct Results(Arc<Mutex<HashMap<Uuid, Held>>>);
+pub struct Results(Arc<Mutex<Inner>>);
+
+#[derive(Default)]
+struct Inner {
+    held: HashMap<Uuid, Held>,
+    /// Insertion order, so the oldest is the one that goes.
+    order: Vec<Uuid>,
+}
 
 impl Results {
     pub fn new() -> Self {
         Results::default()
     }
 
-    pub fn insert(&self, query_id: Uuid, held: Held) {
-        self.0
-            .lock()
-            .expect("held results poisoned")
-            .insert(query_id, held);
+    /// Hold a result, and hand back whichever one that pushed out.
+    ///
+    /// Returned rather than dropped here because closing a spool properly is async and
+    /// this runs under a lock. The caller closes it and deletes its file; dropping it
+    /// would work too, at the price of leaving a file behind for the exit sweep.
+    #[must_use = "the evicted result owns an open SQLite file; close it"]
+    pub fn insert(&self, query_id: Uuid, held: Held) -> Option<Held> {
+        let mut inner = self.0.lock().expect("held results poisoned");
+        if inner.held.insert(query_id, held).is_none() {
+            inner.order.push(query_id);
+        }
+        if inner.order.len() <= MAX_HELD_RESULTS {
+            return None;
+        }
+        let oldest = inner.order.remove(0);
+        inner.held.remove(&oldest)
     }
 
     /// Do something with one held result.
@@ -84,7 +116,18 @@ impl Results {
     /// server behind the slowest page. Callers take what they need — a `Spool` is
     /// cheaply cloneable — and let go.
     pub fn with<T>(&self, query_id: Uuid, f: impl FnOnce(&mut Held) -> T) -> Option<T> {
-        let mut map = self.0.lock().expect("held results poisoned");
-        map.get_mut(&query_id).map(f)
+        let mut inner = self.0.lock().expect("held results poisoned");
+        inner.held.get_mut(&query_id).map(f)
     }
+}
+
+/// Close a result the cache pushed out, and take its file with it.
+///
+/// The pool is closed before the file is removed so that nothing is holding it; a
+/// removal that fails anyway is not worth reporting, because the whole spool directory
+/// goes at exit (§4.1) and the next process sweeps whatever a crash left.
+pub async fn release(held: Held) {
+    let path = held.spool.path().to_path_buf();
+    held.spool.close().await;
+    let _ = std::fs::remove_file(path);
 }

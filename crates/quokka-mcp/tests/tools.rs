@@ -608,3 +608,45 @@ async fn sql_and_a_query_id_together_are_refused() {
         .expect_err("ambiguous");
     assert!(err.message.contains("second scan"), "{}", err.message);
 }
+
+/// The bound the CLI never needed. A server that held every result would grow until the
+/// disk did; the oldest goes, and the next call naming it is told so rather than being
+/// handed an empty page.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_oldest_held_result_is_released_and_says_so() {
+    let h = harness(AccessMode::ReadOnly, &["CREATE TABLE t (a INTEGER)"]).await;
+
+    let first = h
+        .query(json!({"connection": "app", "sql": "SELECT 1 AS n"}))
+        .await
+        .expect("run");
+    let oldest = first["query_id"].as_str().expect("id").to_string();
+
+    // One more than the cache holds, so the first one is pushed out.
+    for i in 0..quokka_mcp::MAX_HELD_RESULTS {
+        h.query(json!({"connection": "app", "sql": format!("SELECT {i} AS n")}))
+            .await
+            .expect("run");
+    }
+
+    let err = h
+        .query(json!({"query_id": oldest}))
+        .await
+        .expect_err("that result is gone");
+    assert!(
+        err.message.contains("most recent"),
+        "the message should say what happened: {}",
+        err.message
+    );
+
+    // And the newest is still there, which is the half that makes the bound useful.
+    let newest = h
+        .query(json!({"connection": "app", "sql": "SELECT 'last' AS n"}))
+        .await
+        .expect("run");
+    let id = newest["query_id"].as_str().expect("id").to_string();
+    assert_eq!(
+        rows(&h.query(json!({"query_id": id})).await.expect("still held")).len(),
+        1
+    );
+}
