@@ -87,6 +87,12 @@ crates/
 `--no-default-features` must always yield a working headless CLI with no `wgpu`/`winit`
 in the tree. Keep logic in `quokka-core`, not in iced `update`/`view` functions.
 
+`quokka-policy` sits **below** `quokka-core` in the dependency graph, because
+`execute()` has to consult it before issuing an `ExecutePermit`. It therefore owns every
+parse of SQL — `Dialect`, `AccessMode`, `summarize()` and the classifier all live there,
+re-exported from `quokka-core` so `quokka_core::Dialect` still resolves. One parse serves
+both the log's `statement_kind` and the guardrail's decision, so they cannot disagree.
+
 ## Conventions
 
 - Rust 2021+, `cargo fmt` and `cargo clippy -- -D warnings` clean before every commit.

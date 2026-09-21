@@ -25,6 +25,7 @@ default = []
 [dependencies]
 quokka-audit.workspace = true
 quokka-core.workspace = true
+quokka-mcp.workspace = true
 quokka-driver = { workspace = true, features = ["sqlite", "postgres", "mysql"] }
 # Parquet asked for by name rather than inherited, so `cargo install quokkaquery
 # --no-default-features` — which exists to drop the GUI stack for a container or an
@@ -41,6 +42,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 uuid.workspace = true
 
 [dev-dependencies]
+quokka-driver = { workspace = true, features = ["sqlite"] }
+quokka-spool = { workspace = true }
+rmcp = { workspace = true, default-features = false, features = ["server", "macros"] }
 serde_json.workspace = true
 sqlx = { workspace = true, features = ["sqlite"] }
 tempfile.workspace = true

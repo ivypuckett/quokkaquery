@@ -195,9 +195,15 @@ impl Limits {
 /// Everything the engine needs in order to decide about one statement.
 #[derive(Debug, Clone)]
 pub struct Policy<'a> {
-    /// The connection's mode, already narrowed by whatever posture the surface was
-    /// started with (see [`AccessMode::narrowest`]).
+    /// The connection's own mode, as its configuration sets it.
     pub mode: AccessMode,
+    /// The posture the surface was started with.
+    ///
+    /// Narrows [`Policy::mode`] and can never widen it. Kept separate rather than
+    /// pre-combined so that a denial can say *which* of the two refused — "this
+    /// connection is read-only" and "this server is read-only" send a person to
+    /// different files.
+    pub surface_mode: AccessMode,
     /// The call-site opt-in: `--write` on the CLI, `write: true` over MCP.
     ///
     /// This never widens anything. `mode` is the authorization, set by a human in a
@@ -216,10 +222,17 @@ impl<'a> Policy<'a> {
     pub fn read_only(allow: &'a Allowlist) -> Self {
         Policy {
             mode: AccessMode::ReadOnly,
+            surface_mode: AccessMode::ReadWrite,
             write_requested: false,
             allow,
             default_schema: None,
         }
+    }
+
+    /// The mode that actually applies: the stricter of the connection's and the
+    /// surface's.
+    pub fn effective_mode(&self) -> AccessMode {
+        self.mode.narrowest(self.surface_mode)
     }
 
     /// Allow it, or say why not.
@@ -244,8 +257,15 @@ impl<'a> Policy<'a> {
         if !summary.is_certainly_read_only() {
             let kind = summary.statement_kind.clone();
             let certain = summary.read_only == Some(false);
-            if self.mode.is_read_only() {
-                return Outcome::Deny(Denial::WriteOnReadOnlyConnection { kind, certain });
+            if self.effective_mode().is_read_only() {
+                return Outcome::Deny(Denial::WriteOnReadOnlyConnection {
+                    kind,
+                    certain,
+                    // Which of the two said no. Both can, and a message that named the
+                    // wrong one would send someone to edit a file that already says what
+                    // they want it to say.
+                    by_surface: !self.mode.is_read_only(),
+                });
             }
             if !self.write_requested {
                 return Outcome::Deny(Denial::WriteNotOptedIn { kind, certain });
@@ -317,6 +337,9 @@ pub enum Denial {
         /// False when the classifier could not read the statement and treated it as a
         /// write on principle.
         certain: bool,
+        /// True when the connection allows writes and the *surface* does not — a
+        /// `quokka mcp` started without `--allow-writes`, say.
+        by_surface: bool,
     },
     /// A write against a `read_write` connection, with no opt-in at the call site.
     WriteNotOptedIn { kind: Option<String>, certain: bool },
@@ -361,11 +384,24 @@ impl Denial {
                  a stored procedure — counts as several here when this build's parser \
                  cannot read it, which is the conservative way round.)"
             ),
-            Denial::WriteOnReadOnlyConnection { kind, certain } => format!(
+            Denial::WriteOnReadOnlyConnection {
+                kind,
+                certain,
+                by_surface: false,
+            } => format!(
                 "refusing {} on connection {connection:?}, which is \
                  `mode = \"read_only\"`.{} The mode binds every surface identically — the \
                  human at the UI as much as an agent — and it is human-only \
                  configuration: change it in the config file, not from here.",
+                describe(kind),
+                caveat(*certain),
+            ),
+            Denial::WriteOnReadOnlyConnection { kind, certain, .. } => format!(
+                "refusing {} on connection {connection:?}. The connection allows writes; \
+                 this server was started read-only and so refuses them anyway.{} A \
+                 surface may be stricter than a connection and never more permissive — \
+                 restarting it differently is a human's decision, not one available from \
+                 here.",
                 describe(kind),
                 caveat(*certain),
             ),

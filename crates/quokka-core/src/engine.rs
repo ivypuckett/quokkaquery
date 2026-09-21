@@ -178,7 +178,12 @@ pub struct Retained {
 ///
 /// At M0 this is the CLI's formatter. At M2 the spool implements it, and every surface
 /// reads from the spool instead.
-pub trait RowSink {
+///
+/// `Send` is a supertrait so that `execute()` itself is `Send`, which a long-lived
+/// server needs and a CLI never noticed: `&mut dyn RowSink` is only `Send` when the
+/// trait object is, and without it M3's MCP request handlers could not call the one
+/// execute path at all. No sink loses anything by it — a sink is somewhere to put a row.
+pub trait RowSink: Send {
     /// Called once, before any row, with the result's shape.
     fn begin(&mut self, columns: &[Column]) -> std::io::Result<()>;
     /// Called once per row, in arrival order.
@@ -598,7 +603,8 @@ pub async fn explain(
     let timeout = cfg.limits.cap_timeout(request.timeout);
 
     let policy = Policy {
-        mode: cfg.mode.narrowest(request.surface_mode),
+        mode: cfg.mode,
+        surface_mode: request.surface_mode,
         // Explaining is never a write, so there is nothing to opt into — and nothing an
         // opt-in could unlock, since the classification above is of the statement being
         // explained.
@@ -1069,9 +1075,10 @@ async fn until<F: std::future::Future>(
 /// invariant 9 says it binds them identically.
 fn policy_for<'a>(cfg: &'a ConnectionConfig, request: &'a ExecuteRequest) -> Policy<'a> {
     Policy {
-        // `narrowest`, never `request.surface_mode` alone: a surface may refuse what the
-        // connection allows and can never allow what the connection refuses.
-        mode: cfg.mode.narrowest(request.surface_mode),
+        // Both, unmixed: `Policy` narrows them itself, and keeping them apart is what
+        // lets a denial name whichever one said no.
+        mode: cfg.mode,
+        surface_mode: request.surface_mode,
         write_requested: request.write,
         allow: &cfg.allow,
         default_schema: cfg.schema.as_deref(),

@@ -566,6 +566,7 @@ fn a_write_needs_the_mode_and_the_opt_in() {
 
     let read_only = Policy {
         mode: AccessMode::ReadOnly,
+        surface_mode: AccessMode::ReadWrite,
         write_requested: true,
         allow: &allow,
         default_schema: None,
@@ -580,6 +581,7 @@ fn a_write_needs_the_mode_and_the_opt_in() {
 
     let no_opt_in = Policy {
         mode: AccessMode::ReadWrite,
+        surface_mode: AccessMode::ReadWrite,
         write_requested: false,
         allow: &allow,
         default_schema: None,
@@ -594,6 +596,7 @@ fn a_write_needs_the_mode_and_the_opt_in() {
 
     let both = Policy {
         mode: AccessMode::ReadWrite,
+        surface_mode: AccessMode::ReadWrite,
         write_requested: true,
         allow: &allow,
         default_schema: None,
@@ -619,6 +622,7 @@ fn unreadable_text_is_a_write() {
 
     let authorized = Policy {
         mode: AccessMode::ReadWrite,
+        surface_mode: AccessMode::ReadWrite,
         write_requested: true,
         allow: &allow,
         default_schema: None,
@@ -630,6 +634,55 @@ fn unreadable_text_is_a_write() {
     );
 }
 
+/// A surface may be stricter than a connection, and the denial says which one refused —
+/// because "this connection is read-only" and "this server is read-only" send a person
+/// to different files.
+#[test]
+fn a_surface_can_be_stricter_than_the_connection_and_says_so() {
+    let allow = Allowlist::none();
+    let s = summarize("DELETE FROM t", Dialect::Postgres);
+
+    let narrowed = Policy {
+        mode: AccessMode::ReadWrite,
+        surface_mode: AccessMode::ReadOnly,
+        write_requested: true,
+        allow: &allow,
+        default_schema: None,
+    };
+    let denial = narrowed.decide(&s).denial().cloned().expect("denied");
+    assert!(matches!(
+        denial,
+        Denial::WriteOnReadOnlyConnection {
+            by_surface: true,
+            ..
+        }
+    ));
+    let message = denial.explain("prod");
+    assert!(
+        message.contains("this server was started read-only"),
+        "{message}"
+    );
+
+    // And the other way round, which must remain impossible: a permissive surface
+    // cannot open a read-only connection.
+    let widened = Policy {
+        mode: AccessMode::ReadOnly,
+        surface_mode: AccessMode::ReadWrite,
+        write_requested: true,
+        allow: &allow,
+        default_schema: None,
+    };
+    let denial = widened.decide(&s).denial().cloned().expect("denied");
+    assert!(matches!(
+        denial,
+        Denial::WriteOnReadOnlyConnection {
+            by_surface: false,
+            ..
+        }
+    ));
+    assert!(denial.explain("prod").contains("mode = \"read_only\""));
+}
+
 /// Stacked statements are refused whatever the mode — the rule is about the shape of
 /// the body, not about who may write.
 #[test]
@@ -637,6 +690,7 @@ fn stacked_statements_are_refused_even_with_every_key_turned() {
     let allow = Allowlist::none();
     let policy = Policy {
         mode: AccessMode::ReadWrite,
+        surface_mode: AccessMode::ReadWrite,
         write_requested: true,
         allow: &allow,
         default_schema: None,
@@ -669,6 +723,7 @@ mod allowlist {
     fn policy<'a>(allow: &'a Allowlist, schema: Option<&'a str>) -> Policy<'a> {
         Policy {
             mode: AccessMode::ReadOnly,
+            surface_mode: AccessMode::ReadWrite,
             write_requested: false,
             allow,
             default_schema: schema,
@@ -778,6 +833,7 @@ mod allowlist {
         let allow = Allowlist::new([], ["t".to_string()]).expect("valid");
         let p = Policy {
             mode: AccessMode::ReadWrite,
+            surface_mode: AccessMode::ReadWrite,
             write_requested: true,
             allow: &allow,
             default_schema: None,

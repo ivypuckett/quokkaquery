@@ -137,6 +137,22 @@ enum Command {
     /// Read and check the audit log.
     #[command(subcommand)]
     Audit(AuditCommand),
+    /// Serve the Model Context Protocol over stdio, for an agent client (§6.2).
+    Mcp(McpArgs),
+}
+
+#[derive(Debug, Args)]
+struct McpArgs {
+    /// Let writes through on connections whose own mode already allows them.
+    ///
+    /// Off by default, so this server is read-only however a connection is configured.
+    /// That is the point rather than an inconvenience: the flag lives in an MCP client's
+    /// configuration file, which a human writes, so an agent's `write: true` is confined
+    /// to what *two* human decisions already allowed — the connection's mode and this.
+    /// It can only ever narrow a connection's mode, never widen one, which is why it is
+    /// not the per-surface exemption invariant 9 forbids.
+    #[arg(long)]
+    allow_writes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -509,6 +525,8 @@ fn error_format(cli: &Cli) -> Format {
         Command::Audit(AuditCommand::Tail(a)) => a.format,
         Command::Audit(AuditCommand::Query(a)) => a.format,
         Command::Audit(AuditCommand::Verify(a)) => a.format,
+        // Nothing this subcommand prints goes to stdout at all — that is the transport.
+        Command::Mcp(_) => Format::Table,
     }
 }
 
@@ -693,6 +711,42 @@ async fn run(cli: Cli) -> Result<u8> {
             .await?
         }
         Command::Audit(AuditCommand::Verify(args)) => verify(&engine, args.format).await?,
+        Command::Mcp(args) => {
+            // The spool set is claimed for the life of the server, not per request:
+            // §6.2's payoff is that a query runs once and every page after it is a read
+            // of the file it left behind.
+            let set = SpoolSet::open(None, spool_limits).await.context(
+                "preparing the result spool; set $QUOKKA_CACHE_DIR to choose where \
+                 spools live",
+            )?;
+            let mode = if args.allow_writes {
+                quokka_core::AccessMode::ReadWrite
+            } else {
+                quokka_core::AccessMode::ReadOnly
+            };
+            // stderr, never stdout: stdout *is* the protocol.
+            eprintln!(
+                "quokka mcp: serving on stdio, {} ({} connections)",
+                match mode {
+                    quokka_core::AccessMode::ReadOnly =>
+                        "read-only (pass --allow-writes to honour read_write connections)",
+                    quokka_core::AccessMode::ReadWrite =>
+                        "writes allowed on read_write connections",
+                },
+                engine.registry().names().count()
+            );
+            let set = Arc::new(set);
+            let result = quokka_mcp::serve_stdio(engine.clone(), set.clone(), actor, mode).await;
+            // The clean exit of §4.1, once the server has let go of its handle. If it
+            // has not — a panic somewhere holding a clone — the directory is left for
+            // the next process's sweep rather than deleted from under whatever still
+            // has it open.
+            if let Ok(set) = Arc::try_unwrap(set) {
+                set.close().await;
+            }
+            result?;
+            exit::OK
+        }
     };
 
     // The clean exit of §4.1: the spool directory goes, so nothing of this result

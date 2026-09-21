@@ -579,6 +579,38 @@ configuration — not a privilege escalation flow.
 This layer matters more than any driver. An agent with a raw `psql` shell is a liability;
 an agent with a classified, capped, logged query tool is a teammate.
 
+**What M3 settled, which this section left open.** Three questions only turn up once the
+classifier exists, and each is recorded here because the answer is not recoverable later:
+
+1. **A statement the parser cannot read is handled as a write.** Not a special case: the
+   rule is "anything not *certainly* a read", so unreadable text and a known `DELETE` are
+   one question — may this connection be written to? Failing open instead would make the
+   guardrail advisory, since every corner of syntax `sqlparser` is behind on becomes a
+   hole. There is no `--force`; the way out is the config file, which is human-only. To
+   keep the cost off the common case, text that fails to parse is classified a second time
+   from the *token* stream — a body that begins with a reading keyword and holds no writing
+   word is a read — which is not the keyword scan §9's corpus exists to reject, because a
+   comment, a literal and an identifier are no longer keyword-shaped once tokenized.
+2. **A denial is two events, and its SQL is logged at the connection's own fidelity.**
+   `query_started` then `query_finished` with `status = 'denied'`, so the `queries` view
+   reports a denial rather than an unfinished query. "Audited with the SQL that triggered
+   it" means *at that connection's `sql_logging`*: storing full text because a query was
+   refused would let anyone who can get a statement denied on purpose write literals into
+   the log of a connection whose owner asked for none — an exfiltration channel into the
+   audit trail, opened by the feature meant to close one.
+3. **`EXPLAIN` is a query pair and obeys the same mode.** It executes SQL, so invariant 1
+   binds it. Explaining a write needs the same access as running one: a plain `EXPLAIN`
+   does not execute on any engine here, but relaxing on that basis would rest on a
+   per-engine claim inherited silently by every future driver, which is what §3.0 exists
+   to avoid.
+
+**A surface may be stricter than a connection, never more permissive.** `quokka mcp`
+refuses writes unless started with `--allow-writes`, whatever a connection's mode says.
+This is not an exception to the paragraph above: an exception would be a surface that gets
+*more* than the mode allows. It is also what makes an agent's call-site opt-in more than
+theatre — the two keys that matter are both held by a human, in the config file and at the
+server's launch, and the agent's flag can only decline authority it was already given.
+
 ### 6.4 Cost guard
 
 Athena bills by data scanned, so a runaway query is a bill rather than an error. Two
@@ -745,6 +777,12 @@ and Azure Data Studio do not, and it should be real before any pixels are pushed
 | Read-only default in the UI | **Binds both surfaces identically** | An exception would make "one execute path" a per-surface policy rather than a property. The UI earns it back by making the mode unmissable |
 | Logging schema introspection | **One `introspect` event per catalog refresh**, not a query pair | Catalog reads are the driver's own bounded SQL on a TTL, not the caller's. Two events per autocomplete refresh would bury the log review exists to read (§5) |
 | Audit retention | **Keep everything, for now** | `fingerprint` keeps the file small and complete history makes review worthwhile. Policies land at M7 |
+| A statement the classifier cannot read | **Treated as a write** | Failing open makes the guardrail advisory; one rule for "not certainly a read" keeps it from having a shape an unusual dialect can slip through (§6.3) |
+| The shape of a denial in the log | **Two events, `status = 'denied'`** | A single row would make the `queries` view report an unfinished query. No new column: `row_hash` covers a fixed field list, so one would break every existing chain |
+| SQL text on a denial | **The connection's own `sql_logging`** | Storing more because a query was refused turns the guardrail into a way to write literals into a `fingerprint` connection's log (§5.1) |
+| Explaining a write on a read-only connection | **Denied** | The relaxation would rest on a per-engine claim about whether `EXPLAIN` executes, inherited by every driver added later (§3.0) |
+| The MCP server's connection registry | **Shared with the CLI; every connection visible** | A connection an agent cannot see is one it cannot reach, so hiding would be a second weaker guardrail competing with the mode. Visibility is documentation (§6.2) |
+| Writes over MCP | **Read-only unless launched `--allow-writes`** | A surface may narrow a connection's mode and never widen one, so an agent's `write: true` is confined to what two human decisions already allowed |
 
 The single-user decision is load-bearing in more places than it looks: it removes the
 shared Postgres sink, accounts, and any notion of non-repudiation between people, and it
