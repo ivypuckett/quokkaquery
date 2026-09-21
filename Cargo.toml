@@ -5,6 +5,7 @@ members = [
     "crates/quokka-driver",
     "crates/quokka-audit",
     "crates/quokka-spool",
+    "crates/quokka-policy",
     "crates/quokka-cli",
 ]
 
@@ -22,6 +23,7 @@ quokka-core = { path = "crates/quokka-core", version = "0.0.1" }
 quokka-driver = { path = "crates/quokka-driver", version = "0.0.1" }
 quokka-audit = { path = "crates/quokka-audit", version = "0.0.1" }
 quokka-spool = { path = "crates/quokka-spool", version = "0.0.1" }
+quokka-policy = { path = "crates/quokka-policy", version = "0.0.1" }
 
 anyhow = "1"
 async-trait = "0.1"

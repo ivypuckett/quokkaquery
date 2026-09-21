@@ -163,11 +163,29 @@ impl Driver for SqliteDriver {
         _permit: &ExecutePermit,
         req: QueryRequest,
     ) -> Result<QueryStream, DriverError> {
-        // SQLite executes every statement in a multi-statement body, and the column
-        // list below describes only the first. Rejecting stacked queries is
-        // `quokka-policy`'s job at M3 (ARCHITECTURE §6.3); until then the log records
-        // the whole body's fingerprint, so what ran is visible even where the result
-        // shape is not.
+        // The stacked-query surprise §6.3 names, closed from the driver's own side.
+        //
+        // Until M3 this driver had a real hole: with nothing bound, execution went
+        // through `sqlx::raw_sql`, which runs a whole multi-statement body, while
+        // `describe_columns` described only the first statement of it — so a stacked body
+        // ran in full and came back wearing the shape of its opening `SELECT`.
+        //
+        // Rejecting stacked bodies is `quokka-policy`'s rule and it now runs inside
+        // `execute()`, before anything reaches here. This check is the second layer, and
+        // it is not redundant: `sqlx-sqlite` walks the statement tail *even on the
+        // prepared path*, so unifying the two protocols below made the describe and the
+        // execution agree without making "only one statement runs" true. Only this does.
+        // Postgres and MySQL need no equivalent — their servers refuse to prepare a
+        // multi-statement body, which is the same guarantee arriving from the other end.
+        let statements =
+            quokka_policy::summarize(&req.sql, quokka_core::Dialect::Sqlite).statement_count;
+        if statements > 1 {
+            return Err(DriverError::Unsupported(format!(
+                "this body holds {statements} statements and SQLite would run all of \
+                 them; QuokkaQuery runs one statement per query (§6.3)"
+            )));
+        }
+
         let columns = self.describe_columns(&req.sql).await?;
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -189,18 +207,16 @@ impl Driver for SqliteDriver {
         let handle = req.handle;
 
         tokio::spawn(async move {
-            // Two protocols, chosen by whether anything is bound. `raw_sql` runs a
-            // whole body — which is what a SQL file is — while a bound statement has to
-            // be prepared, and a prepared statement is a single statement by
-            // definition. Rejecting stacked statements outright is `quokka-policy`'s
-            // job at M3; until then this is only a shape difference, and the log
-            // records the whole body's fingerprint either way.
-            let mut stream = if params.is_empty() {
-                sqlx::raw_sql(AssertSqlSafe(sql)).fetch_many(&pool).boxed()
-            } else {
-                let query = common::bind_all_sqlite(sqlx::query(AssertSqlSafe(sql)), &params);
-                <&SqlitePool as Executor>::fetch_many(&pool, query).boxed()
-            };
+            // One protocol, whether or not anything is bound, so that the statement
+            // `describe_columns` described is the statement that runs. The road not
+            // taken is `sqlx::raw_sql`, which is how this driver used to handle the
+            // unparameterized case: it is the natural way to run a `.sql` file, and that
+            // is exactly the problem — a file is several statements, one query is one
+            // statement, and the audit log's two events describe one query. Running a
+            // file is a feature that needs its own shape (a query pair per statement),
+            // not a side effect of leaving a parameter list empty.
+            let query = common::bind_all_sqlite(sqlx::query(AssertSqlSafe(sql)), &params);
+            let mut stream = <&SqlitePool as Executor>::fetch_many(&pool, query).boxed();
             while let Some(step) = stream.next().await {
                 if task_cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(Err(DriverError::Cancelled)).await;
@@ -260,12 +276,34 @@ impl Driver for SqliteDriver {
         }
     }
 
-    async fn explain(&self, _permit: &ExecutePermit, _sql: &str) -> Result<Plan, DriverError> {
-        // Same reasoning as `introspect`: it executes SQL, so it waits for the audited
-        // path that M3's `quokka explain` will call.
-        Err(DriverError::Unsupported(
-            "EXPLAIN arrives with the policy engine at M3".to_string(),
-        ))
+    /// `EXPLAIN QUERY PLAN`, not bare `EXPLAIN`.
+    ///
+    /// SQLite's `EXPLAIN` lists virtual-machine bytecode, which is a debugging aid for
+    /// SQLite itself and tells a person nothing about their query. `EXPLAIN QUERY PLAN`
+    /// is the one that answers "will this use the index", which is the question being
+    /// asked. Neither executes the statement.
+    ///
+    /// Only reachable through `quokka_core::explain()`, which writes the two events
+    /// around it — the [`ExecutePermit`] is what makes that structural (invariant 1).
+    async fn explain(&self, _permit: &ExecutePermit, sql: &str) -> Result<Plan, DriverError> {
+        let rows = sqlx::query(AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(execute_error)?;
+
+        // Four columns — id, parent, notused, detail — of which `detail` is the sentence
+        // a person reads. Indentation by parent would be prettier and would mean
+        // reconstructing SQLite's tree; the details in order are what the shell prints.
+        let text = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>("detail").unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(Plan {
+            dialect: quokka_core::Dialect::Sqlite,
+            text,
+        })
     }
 }
 

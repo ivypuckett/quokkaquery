@@ -66,6 +66,10 @@ pub struct QueryPlan {
     pub export: Option<ExportTarget>,
     pub sort: Vec<String>,
     pub parent_id: Option<Uuid>,
+    /// `--write`: the call-site half of what a write needs (§6.3).
+    pub write: bool,
+    /// `--timeout`: the shorter of this and the connection's own is enforced.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Where an export goes and in what form.
@@ -150,6 +154,8 @@ pub async fn query(
     request.max_rows = plan.read_bound(spools.limits().max_rows);
     request.params = plan.params.clone();
     request.parent_id = plan.parent_id;
+    request.write = plan.write;
+    request.timeout = plan.timeout;
 
     // `--all`: the export is the sink, and nothing is cached.
     if let Some(target) = plan.export.as_ref().filter(|t| t.all) {
@@ -306,6 +312,12 @@ pub async fn export_by_id(
         sort,
         // The re-run is a new query whose parent is the one being cited (§4.1).
         parent_id: Some(query_id),
+        // A re-run is the same statement as before, so it needs the same authorization
+        // as before — which the policy engine will ask for again, on the connection it
+        // ran against. `quokka export` has no `--write` of its own because re-running a
+        // write to fill a file is not a thing to make convenient.
+        write: false,
+        timeout: None,
     };
 
     query(engine, spools, plan, actor).await

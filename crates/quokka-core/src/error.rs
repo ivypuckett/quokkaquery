@@ -110,6 +110,18 @@ pub enum CoreError {
     #[error("writing results failed: {0}")]
     Sink(#[from] std::io::Error),
 
+    /// The policy engine refused the statement (§6.3). Nothing reached a database — not
+    /// even a connection attempt — and the log holds the attempt as a `query_started`
+    /// with a `query_finished` whose status is `denied`.
+    #[error("{message}")]
+    Denied {
+        connection: String,
+        query_id: uuid::Uuid,
+        /// A stable code for scripts and for the log's `error_code` column.
+        code: &'static str,
+        message: String,
+    },
+
     #[error("no query {0} is running on this connection")]
     NotRunning(uuid::Uuid),
 }

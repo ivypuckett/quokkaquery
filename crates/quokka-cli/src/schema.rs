@@ -10,7 +10,10 @@
 //! hit the cache, and a hit must stay silent.
 
 use anyhow::Result;
-use quokka_core::{introspect, Actor, Client, Engine, IntrospectRequest, Scope, TableInfo};
+use quokka_core::{
+    explain as core_explain, introspect, Actor, Client, Engine, ExplainRequest, IntrospectRequest,
+    Scope, TableInfo,
+};
 use serde_json::{Map, Value as Json};
 
 use crate::format::{print_records, Format};
@@ -113,6 +116,53 @@ pub async fn describe(
                 .map(|t| serde_json::to_value(t).unwrap_or(Json::Null))
                 .collect();
             print_records(format, envelope, "tables", records, COLUMNS)?;
+        }
+    }
+
+    Ok(crate::exit::OK)
+}
+
+/// `quokka explain <sql>`.
+///
+/// A thin wrapper over `quokka_core::explain()`, which is what makes it audited: EXPLAIN
+/// runs SQL, so invariant 1 binds it and it leaves the same two events a query leaves.
+/// Note what this does *not* do — reach `Driver::explain` itself. It cannot: the
+/// [`ExecutePermit`](quokka_core::ExecutePermit) that method needs is not constructible
+/// outside `quokka-core`.
+pub async fn explain(
+    engine: &Engine,
+    connection: &str,
+    sql: &str,
+    timeout: Option<std::time::Duration>,
+    format: Format,
+    actor: Actor,
+) -> Result<u8> {
+    let mut request = ExplainRequest::new(connection, sql, actor);
+    request.client = Client::Cli;
+    request.timeout = timeout;
+
+    let outcome = core_explain(engine, request).await?;
+
+    match format {
+        Format::Json | Format::Ndjson => {
+            let envelope = serde_json::json!({
+                "query_id": outcome.query_id.to_string(),
+                "connection": outcome.connection,
+                "dialect": outcome.plan.dialect.as_str(),
+                "duration_ms": outcome.duration_ms,
+                // One string rather than an array of lines: every engine's plan is its
+                // own shape, and splitting one into lines would imply a structure this
+                // program did not parse and does not understand.
+                "plan": outcome.plan.text,
+            });
+            println!("{envelope}");
+        }
+        Format::Table => {
+            println!("{}", outcome.plan.text);
+            eprintln!(
+                "({} plan · {} ms · query {})",
+                outcome.plan.dialect, outcome.duration_ms, outcome.query_id
+            );
         }
     }
 

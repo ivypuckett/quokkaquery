@@ -2593,6 +2593,7 @@ dependencies = [
  "getrandom 0.4.3",
  "keyring",
  "quokka-audit",
+ "quokka-policy",
  "regex",
  "serde",
  "serde_json",
@@ -2615,12 +2616,21 @@ dependencies = [
  "futures",
  "quokka-audit",
  "quokka-core",
+ "quokka-policy",
  "sqlx",
  "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "quokka-policy"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "sqlparser",
 ]
 
 [[package]]

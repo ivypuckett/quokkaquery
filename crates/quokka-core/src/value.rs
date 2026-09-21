@@ -103,30 +103,7 @@ pub struct Column {
     pub nullable: Option<bool>,
 }
 
-/// The SQL dialect a connection speaks. Drives fingerprint parsing and, later, the
-/// policy engine's classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Dialect {
-    Sqlite,
-    Postgres,
-    MySql,
-    Athena,
-}
-
-impl Dialect {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Dialect::Sqlite => "sqlite",
-            Dialect::Postgres => "postgres",
-            Dialect::MySql => "mysql",
-            Dialect::Athena => "athena",
-        }
-    }
-}
-
-impl fmt::Display for Dialect {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+/// The SQL dialect a connection speaks lives in `quokka-policy`, which is the crate
+/// that owns every parse of SQL, and is re-exported here so `quokka_core::Dialect`
+/// still resolves.
+pub use quokka_policy::Dialect;

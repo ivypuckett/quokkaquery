@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use quokka_audit::{
@@ -23,10 +23,12 @@ use quokka_audit::{
 };
 use uuid::Uuid;
 
+use quokka_policy::{AccessMode, Denial, Outcome as PolicyOutcome, Policy, SqlSummary};
+
 use crate::catalog::CatalogCache;
 use crate::config::{dialect_hint, ConnectionConfig, Registry};
 use crate::driver::{
-    Catalog, Driver, DriverFactory, ExecutePermit, QueryHandle, QueryRequest, Scope,
+    Catalog, Driver, DriverFactory, ExecutePermit, Plan, QueryHandle, QueryRequest, Scope,
 };
 use crate::error::{CoreError, DriverError};
 use crate::redact::scrub;
@@ -54,7 +56,30 @@ pub struct ExecuteRequest {
     pub actor: Actor,
     pub client: Client,
     /// Rows delivered to the sink before the result is marked truncated.
+    ///
+    /// A ceiling the connection sets (`max_rows` in its config) lowers this; nothing
+    /// raises it. §6.3 wants the cap enforced here rather than by trusting a `LIMIT` in
+    /// the text, and this is where "here" is.
     pub max_rows: u64,
+    /// How long the statement may run before it is cancelled and logged as `timeout`.
+    ///
+    /// `--timeout` on the CLI. A connection's own `timeout` shortens it, and applies
+    /// when the caller named none.
+    pub timeout: Option<Duration>,
+    /// The call-site opt-in a write needs on top of `mode = read_write` (§6.3).
+    ///
+    /// This never widens anything: the mode is the authorization and only a human can
+    /// set it (invariant 7). What this adds is that the caller had to *mean* it, so a
+    /// mis-generated statement cannot spend authority a human left in the lock.
+    pub write: bool,
+    /// A posture the surface was started with, which may narrow the connection's mode
+    /// and can never widen it.
+    ///
+    /// `quokka mcp` without `--allow-writes` sets `ReadOnly` here, so an agent's
+    /// `write: true` is confined to what *two* human decisions already allowed. Not an
+    /// exemption from invariant 9: an exemption is a surface that gets more than the
+    /// mode allows, and this can only take less.
+    pub surface_mode: AccessMode,
     /// Links a re-run or an export back to the query it came from (§5).
     pub parent_id: Option<Uuid>,
     pub tags: Option<String>,
@@ -69,6 +94,9 @@ impl ExecuteRequest {
             actor,
             client: Client::Cli,
             max_rows: DEFAULT_MAX_ROWS,
+            timeout: None,
+            write: false,
+            surface_mode: AccessMode::ReadWrite,
             parent_id: None,
             tags: None,
         }
@@ -314,6 +342,23 @@ pub async fn execute(
     let summary = summarize(&request.sql, dialect);
     let query_id = Uuid::now_v7();
 
+    // §6.3's caps, applied here rather than by trusting a `LIMIT` in the text. The
+    // connection's ceilings only ever lower what was asked for (invariant 7).
+    let max_rows = cfg.limits.cap_rows(request.max_rows);
+    let timeout = cfg.limits.cap_timeout(request.timeout);
+
+    // The verdict is computed before `query_started` is written and acted on after, so
+    // that a denial is recorded rather than merely returned. The `approved_by` column
+    // needs the answer for the row it is about to write.
+    let verdict = policy_for(&cfg, &request).decide(&summary);
+    let approved_by = match &verdict {
+        // Who turned the second key. The *authorization* is the connection's mode, which
+        // only a human can set; this names the caller that opted in, which together with
+        // `client` and `actor_id` is what a reviewer asking "who ran this write" wants.
+        PolicyOutcome::Allow { writes: true } => Some(request.actor.id.clone()),
+        _ => None,
+    };
+
     // Scrubbing runs in every mode (§5); at `fingerprint` the text is dropped entirely
     // a line later, but the order matters if that default ever changes.
     let sql_text = match cfg.sql_logging {
@@ -354,7 +399,7 @@ pub async fn execute(
         export_path: None,
         data_scanned_bytes: None,
         cost_estimate_usd: None,
-        approved_by: None,
+        approved_by: approved_by.clone(),
         tags: request.tags.clone(),
     };
 
@@ -362,12 +407,23 @@ pub async fn execute(
     // nothing will if the log would not have the record of it.
     engine
         .audit
-        .append(started)
+        .append(started.clone())
         .await
         .map_err(|source| CoreError::AuditWriteFailed { source })?;
 
+    // The guardrail, inside the one execute path (§6.3). It runs *after* the start is on
+    // disk, so what an agent tried is recorded whether or not it was allowed, and
+    // *before* the driver is opened, so a denied statement never reaches one — not even
+    // as a connection attempt.
+    if let Some(denial) = verdict.denial() {
+        return Err(record_denial(engine, started, denial, query_id).await);
+    }
+
     let started_at = Instant::now();
-    let run = run_query(engine, &cfg, query_id, &request, &summary, sink).await;
+    let run = run_query(
+        engine, &cfg, query_id, &request, &summary, max_rows, timeout, sink,
+    )
+    .await;
     let duration_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
 
     let (status, error_code, error_message, columns, rows_returned, rows_affected, truncated) =
@@ -460,7 +516,7 @@ pub async fn execute(
         export_path: None,
         data_scanned_bytes: None,
         cost_estimate_usd: None,
-        approved_by: None,
+        approved_by,
         tags: request.tags.clone(),
     };
 
@@ -473,6 +529,196 @@ pub async fn execute(
     sink_end?;
 
     Ok(outcome)
+}
+
+/// One request for a statement's execution plan.
+#[derive(Debug, Clone)]
+pub struct ExplainRequest {
+    pub connection: String,
+    /// The statement to explain — *not* prefixed with `EXPLAIN`. The driver writes that
+    /// part, which is what keeps `EXPLAIN ANALYZE` — the spelling that actually runs the
+    /// statement — from being reachable from here at all.
+    pub sql: String,
+    pub actor: Actor,
+    pub client: Client,
+    pub timeout: Option<Duration>,
+    pub surface_mode: AccessMode,
+}
+
+impl ExplainRequest {
+    pub fn new(connection: impl Into<String>, sql: impl Into<String>, actor: Actor) -> Self {
+        Self {
+            connection: connection.into(),
+            sql: sql.into(),
+            actor,
+            client: Client::Cli,
+            timeout: None,
+            surface_mode: AccessMode::ReadWrite,
+        }
+    }
+}
+
+/// A plan, and the query pair that recorded asking for it.
+#[derive(Debug, Clone)]
+pub struct ExplainOutcome {
+    pub query_id: Uuid,
+    pub connection: String,
+    pub plan: Plan,
+    pub duration_ms: i64,
+}
+
+/// Ask the engine for a statement's plan, on the audited path (§6.1, invariant 1).
+///
+/// `EXPLAIN` executes SQL, so this is a query like any other: the same policy check, the
+/// same two events sharing a `query_id`, the same fail-closed rule. It is not
+/// [`introspect()`]'s single-event shape, because the statement is the *caller's* — §5 is
+/// explicit that the day a surface runs its own catalog query, it is a query pair.
+///
+/// **Explaining a write needs the same authorization as running one.** A plain `EXPLAIN`
+/// does not execute the statement on any engine this build supports, so it is tempting to
+/// let a read-only connection explain a `DELETE`: it is a safe and useful thing to want.
+/// We do not, for the reason §3.0 gives for not claiming support we have not tested — the
+/// relaxation would rest on a per-engine claim about whether `EXPLAIN` executes, made
+/// once here and silently inherited by every driver added later. The mode binds every
+/// statement identically instead, and the cost is a missing convenience rather than a
+/// guarantee with an exception in it. A relaxation can be added later; the reverse cannot.
+pub async fn explain(
+    engine: &Engine,
+    request: ExplainRequest,
+) -> Result<ExplainOutcome, CoreError> {
+    let cfg = engine
+        .registry
+        .get(&request.connection)
+        .cloned()
+        .ok_or_else(|| CoreError::UnknownConnection(request.connection.clone()))?;
+
+    let dialect = dialect_hint(&cfg.driver);
+    let summary = summarize(&request.sql, dialect);
+    let query_id = Uuid::now_v7();
+    let timeout = cfg.limits.cap_timeout(request.timeout);
+
+    let policy = Policy {
+        mode: cfg.mode.narrowest(request.surface_mode),
+        // Explaining is never a write, so there is nothing to opt into — and nothing an
+        // opt-in could unlock, since the classification above is of the statement being
+        // explained.
+        write_requested: false,
+        allow: &cfg.allow,
+        default_schema: cfg.schema.as_deref(),
+    };
+    let verdict = policy.decide(&summary);
+
+    let sql_text = match cfg.sql_logging {
+        SqlLogging::Full => Some(scrub(&request.sql)),
+        SqlLogging::Fingerprint => None,
+    };
+
+    let started = AuditEvent {
+        id: Uuid::now_v7(),
+        query_id,
+        parent_id: None,
+        at: quokka_audit::now_rfc3339()?,
+        duration_ms: None,
+        actor_kind: request.actor.kind,
+        actor_id: request.actor.id.clone(),
+        session_id: engine.session_id.clone(),
+        client: request.client,
+        connection: cfg.name.clone(),
+        dialect: dialect.as_str().to_string(),
+        database: cfg.database.clone(),
+        schema_name: cfg.schema.clone(),
+        event_kind: EventKind::QueryStarted,
+        sql_logging: cfg.sql_logging,
+        sql_text,
+        // The fingerprint says what was sent, which is the explained statement's shape
+        // with `EXPLAIN` in front of it. `statement_kind` says this was an explain, and
+        // `read_only` keeps the *explained* statement's nature — so a review that asks
+        // "did anyone look at how this delete would run" can answer it.
+        sql_fingerprint: format!("EXPLAIN {}", summary.fingerprint),
+        statement_kind: Some("explain".to_string()),
+        read_only: summary.read_only,
+        params: None,
+        status: Status::Started,
+        error_code: None,
+        error_message: None,
+        rows_returned: None,
+        rows_affected: None,
+        rows_spooled: None,
+        truncated: None,
+        export_format: None,
+        export_path: None,
+        data_scanned_bytes: None,
+        cost_estimate_usd: None,
+        approved_by: None,
+        tags: None,
+    };
+
+    engine
+        .audit
+        .append(started.clone())
+        .await
+        .map_err(|source| CoreError::AuditWriteFailed { source })?;
+
+    if let Some(denial) = verdict.denial() {
+        return Err(record_denial(engine, started, denial, query_id).await);
+    }
+
+    let at = Instant::now();
+    let run = run_explain(engine, &cfg, &request.sql, timeout).await;
+    let duration_ms = at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+
+    let (status, error_code, error_message) = match &run {
+        Ok(_) => (Status::Ok, None, None),
+        Err(e) => (
+            e.status,
+            Some(e.code.clone()),
+            Some(scrub(&e.message.clone())),
+        ),
+    };
+
+    let finished = AuditEvent {
+        id: Uuid::now_v7(),
+        at: quokka_audit::now_rfc3339()?,
+        duration_ms: Some(duration_ms),
+        event_kind: EventKind::QueryFinished,
+        sql_text: None,
+        status,
+        error_code,
+        error_message,
+        ..started
+    };
+
+    engine
+        .audit
+        .append(finished)
+        .await
+        .map_err(|source| CoreError::AuditFinishFailed { query_id, source })?;
+
+    let plan = run.map_err(|e| e.into_core())?;
+    Ok(ExplainOutcome {
+        query_id,
+        connection: cfg.name,
+        plan,
+        duration_ms,
+    })
+}
+
+async fn run_explain(
+    engine: &Engine,
+    cfg: &ConnectionConfig,
+    sql: &str,
+    timeout: Option<Duration>,
+) -> Result<Plan, RunFailure> {
+    let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+    let driver = engine
+        .driver_for(cfg)
+        .await
+        .map_err(|e| RunFailure::from_core(e, Partial::default()))?;
+    let permit = ExecutePermit::issue();
+    match until(deadline, driver.explain(&permit, sql)).await {
+        Some(result) => result.map_err(|e| RunFailure::from_driver(e, Partial::default())),
+        None => Err(RunFailure::timed_out(timeout, Partial::default())),
+    }
 }
 
 /// One request to refresh part of a connection's catalog.
@@ -698,14 +944,34 @@ struct RunFailure {
     partial: Partial,
 }
 
+impl RunFailure {
+    /// The error a caller sees when there is no [`Outcome`] to hand back — the explain
+    /// path, where the result is a plan rather than a stream of rows.
+    fn into_core(self) -> CoreError {
+        CoreError::Driver(match self.status {
+            Status::Cancelled => DriverError::Cancelled,
+            _ => DriverError::Execute {
+                detail: self.message,
+            },
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_query(
     engine: &Engine,
     cfg: &ConnectionConfig,
     query_id: Uuid,
     request: &ExecuteRequest,
-    summary: &crate::sql::SqlSummary,
+    summary: &SqlSummary,
+    max_rows: u64,
+    timeout: Option<Duration>,
     sink: &mut dyn RowSink,
 ) -> Result<Partial, RunFailure> {
+    // A deadline rather than a timer per step: the budget is for the statement, not for
+    // each row, so a query that trickles a row a second does not get to run forever.
+    let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
+
     let driver = engine
         .driver_for(cfg)
         .await
@@ -724,10 +990,15 @@ async fn run_query(
     }
     let _guard = InflightGuard { engine, query_id };
 
-    let mut stream = driver
-        .execute(&permit, query_request)
-        .await
-        .map_err(|e| RunFailure::from_driver(e, Partial::default()))?;
+    let mut stream = match until(deadline, driver.execute(&permit, query_request)).await {
+        Some(result) => result.map_err(|e| RunFailure::from_driver(e, Partial::default()))?,
+        None => {
+            // Nothing has streamed yet, but the statement may well be running on the
+            // server, so the driver is asked to stop it before we walk away.
+            let _ = driver.cancel(QueryHandle(query_id)).await;
+            return Err(RunFailure::timed_out(timeout, Partial::default()));
+        }
+    };
 
     let mut partial = Partial {
         columns: stream.columns.clone(),
@@ -738,10 +1009,18 @@ async fn run_query(
         return Err(RunFailure::from_sink(e, partial));
     }
 
-    while let Some(item) = stream.rows.next().await {
+    loop {
+        let Some(next) = until(deadline, stream.rows.next()).await else {
+            // The rows already in the sink stay there and are reported: a timeout is a
+            // partial result, and `truncated` says the caller is holding a prefix.
+            let _ = driver.cancel(QueryHandle(query_id)).await;
+            partial.truncated = true;
+            return Err(RunFailure::timed_out(timeout, partial));
+        };
+        let Some(item) = next else { break };
         match item {
             Ok(row) => {
-                if partial.rows_returned >= request.max_rows {
+                if partial.rows_returned >= max_rows {
                     // One row past the cap is how truncation becomes known. It costs a
                     // row, never a second execution (§1.4).
                     partial.truncated = true;
@@ -767,6 +1046,108 @@ async fn run_query(
         partial.rows_affected = stream.meta.snapshot().rows_affected;
     }
     Ok(partial)
+}
+
+/// Await `future`, giving up at `deadline`. `None` means the deadline arrived first.
+///
+/// `None` rather than an error type because the caller has different things to say
+/// depending on how far it had got, and a deadline is not a failure of the future.
+async fn until<F: std::future::Future>(
+    deadline: Option<tokio::time::Instant>,
+    future: F,
+) -> Option<F::Output> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at, future).await.ok(),
+        None => Some(future.await),
+    }
+}
+
+/// The rules this connection and this call site put on the statement (§6.3).
+///
+/// Assembled here, inside `execute()`, rather than passed in by a surface — a guardrail
+/// a surface could assemble differently is one that binds the surfaces differently, and
+/// invariant 9 says it binds them identically.
+fn policy_for<'a>(cfg: &'a ConnectionConfig, request: &'a ExecuteRequest) -> Policy<'a> {
+    Policy {
+        // `narrowest`, never `request.surface_mode` alone: a surface may refuse what the
+        // connection allows and can never allow what the connection refuses.
+        mode: cfg.mode.narrowest(request.surface_mode),
+        write_requested: request.write,
+        allow: &cfg.allow,
+        default_schema: cfg.schema.as_deref(),
+    }
+}
+
+/// Append the `query_finished` row for a denial, then report it.
+///
+/// **A denial is two events like any other query**, sharing one `query_id` (invariant 5).
+/// It would have been tempting to give it a shape of its own — one row, since nothing
+/// ran — but the `queries` view joins a start to a finish and reports `unfinished` when
+/// the finish is missing, so a lone row would make the view claim a query had been killed
+/// mid-flight. A start plus a finish with `status = 'denied'` is the shape that already
+/// exists and the one the view reads correctly.
+///
+/// **And the SQL is logged at the connection's fidelity, not at a denial's.** §6.3 says a
+/// denial is audited "with the SQL that triggered it", and the SQL is on the
+/// `query_started` row this function is handed — at `fingerprint`, that is the shape with
+/// its literals replaced, exactly as for a query that ran. Special-casing `denied` into
+/// storing full text would mean anyone who can get a statement refused on purpose can
+/// write literals into the log of a connection whose owner asked for none: an
+/// exfiltration channel *into* the audit trail, opened by the feature meant to close one.
+/// Invariant 8 does not lift because the news is bad.
+async fn record_denial(
+    engine: &Engine,
+    started: AuditEvent,
+    denial: &Denial,
+    query_id: Uuid,
+) -> CoreError {
+    let connection = started.connection.clone();
+    let message = denial.explain(&connection);
+
+    let at = match quokka_audit::now_rfc3339() {
+        Ok(at) => at,
+        Err(source) => return CoreError::AuditFinishFailed { query_id, source },
+    };
+
+    let finished = AuditEvent {
+        id: Uuid::now_v7(),
+        at,
+        // Nothing ran, so there is nothing to have taken time. Zero rather than NULL:
+        // the column means "how long this query took", and the answer is none of it.
+        duration_ms: Some(0),
+        event_kind: EventKind::QueryFinished,
+        // The text and the bound values live on the `query_started` row alone, exactly
+        // as for a query that ran.
+        sql_text: None,
+        params: None,
+        status: Status::Denied,
+        error_code: Some(denial.code().to_string()),
+        // Scrubbed like every other message that reaches the log, though none of these
+        // carries user text: a denial names the rule, the statement kind and at most an
+        // identifier — never the statement.
+        error_message: Some(scrub(&message)),
+        rows_returned: None,
+        rows_affected: None,
+        rows_spooled: None,
+        truncated: None,
+        // Whatever was asked for, nothing was authorized.
+        approved_by: None,
+        ..started
+    };
+
+    if let Err(source) = engine.audit.append(finished).await {
+        // The louder problem wins. The query did not run either way, and the caller
+        // learns that from the error; what it must not do is carry on believing the log
+        // is complete.
+        return CoreError::AuditFinishFailed { query_id, source };
+    }
+
+    CoreError::Denied {
+        connection,
+        query_id,
+        code: denial.code(),
+        message,
+    }
 }
 
 struct InflightGuard<'a> {
@@ -797,6 +1178,24 @@ impl RunFailure {
             status,
             code: e.code().to_string(),
             message: scrub(&e.to_string()),
+            partial,
+        }
+    }
+
+    /// The statement outran its budget. §6.3's other server-side cap, and its own status
+    /// in the log rather than a generic error, because "this took too long" and "this
+    /// failed" are different things to a reviewer and to a script.
+    fn timed_out(timeout: Option<Duration>, partial: Partial) -> Self {
+        let budget = timeout
+            .map(|t| format!("{:?}", t))
+            .unwrap_or_else(|| "its budget".to_string());
+        RunFailure {
+            status: Status::Timeout,
+            code: "policy.timeout".to_string(),
+            message: format!(
+                "the statement ran longer than {budget} and was cancelled. The budget is \
+                 the connection's `timeout` or this call's, whichever is shorter."
+            ),
             partial,
         }
     }

@@ -55,6 +55,15 @@ pub mod exit {
     /// this should retry the file, not re-examine its arguments — and the rows are in
     /// the log either way.
     pub const EXPORT_FAILED: u8 = 5;
+    /// The policy engine refused the statement (§6.3). Nothing ran.
+    ///
+    /// Its own code for the same reason `EXPORT_FAILED` has one: neither neighbour is
+    /// true. It is not a usage error — the arguments were well formed and the SQL may be
+    /// perfectly good — and it is not a failed query, because no query happened. A
+    /// script that sees this should stop and ask a human for a configuration change, not
+    /// retry and not re-examine its arguments, and that is a different response from
+    /// either of the others. The denial is in the log with `status = 'denied'`.
+    pub const DENIED: u8 = 6;
 }
 
 #[derive(Debug, Parser)]
@@ -109,6 +118,11 @@ impl From<ActorKindArg> for ActorKind {
 enum Command {
     /// Run SQL against a connection.
     Query(QueryArgs),
+    /// Show a statement's execution plan, without running it.
+    ///
+    /// On the audited path like everything else: EXPLAIN executes SQL, so it leaves the
+    /// same two events a query leaves (invariant 1).
+    Explain(ExplainArgs),
     /// Write an earlier query's rows to a file. Needs --rerun, and says why.
     Export(ExportArgs),
     /// Show the configured connections.
@@ -260,6 +274,71 @@ struct QueryArgs {
     /// only how many there were.
     #[arg(long = "param", value_name = "[TYPE:]VALUE")]
     params: Vec<String>,
+
+    /// Allow this statement to write (§6.3).
+    ///
+    /// Needed on top of `mode = "read_write"` in the connection's configuration, never
+    /// instead of it: this flag cannot make a read-only connection writable, and it is
+    /// not a way to ask for one. What it buys is that a write is always something
+    /// someone typed rather than something a generated statement turned out to be.
+    #[arg(long)]
+    write: bool,
+
+    /// Give up after this long and cancel the statement. `30s`, `5m`.
+    ///
+    /// Enforced here rather than by trusting the server (§6.3). A connection's own
+    /// `timeout` shortens this and applies when it is not given; nothing lengthens it.
+    #[arg(long, value_name = "DURATION", value_parser = parse_timeout)]
+    timeout: Option<std::time::Duration>,
+}
+
+/// `30s`, `5m`, `1h`, or a bare number of seconds.
+fn parse_timeout(text: &str) -> Result<std::time::Duration, String> {
+    let text = text.trim();
+    let (digits, scale) = match text.strip_suffix(|c: char| c.is_ascii_alphabetic()) {
+        Some(rest) => {
+            let unit = &text[rest.len()..];
+            let scale = match unit {
+                "s" => 1u64,
+                "m" => 60,
+                "h" => 3600,
+                other => return Err(format!("{other:?} is not a unit; use s, m or h")),
+            };
+            (rest, scale)
+        }
+        None => (text, 1),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("{text:?} is not a duration; write it as \"30s\" or \"5m\""))?;
+    if n == 0 {
+        return Err("a timeout of 0 would cancel the statement before it started".to_string());
+    }
+    Ok(std::time::Duration::from_secs(
+        n.checked_mul(scale)
+            .ok_or_else(|| format!("{text:?} is longer than this program can wait"))?,
+    ))
+}
+
+#[derive(Debug, Args)]
+struct ExplainArgs {
+    #[arg(short, long, value_name = "NAME")]
+    connection: String,
+
+    #[arg(value_name = "SQL")]
+    sql: Option<String>,
+
+    /// Read the SQL from a file. `-` reads stdin.
+    #[arg(short = 'f', long, value_name = "PATH", conflicts_with = "sql")]
+    file: Option<PathBuf>,
+
+    /// Give up after this long. `30s`, `5m`. The connection's own `timeout` shortens it.
+    #[arg(long, value_name = "DURATION", value_parser = parse_timeout)]
+    timeout: Option<std::time::Duration>,
+
+    #[arg(long, value_enum, default_value = "table")]
+    format: Format,
 }
 
 #[derive(Debug, Args)]
@@ -419,6 +498,7 @@ async fn main() -> ExitCode {
 fn error_format(cli: &Cli) -> Format {
     match &cli.command {
         Command::Query(a) => a.format,
+        Command::Explain(a) => a.format,
         Command::Export(a) => a.format,
         Command::Connections(ConnectionsCommand::List(a)) => a.format,
         Command::Schema(SchemaCommand::Describe(a)) => a.format,
@@ -493,7 +573,21 @@ async fn run(cli: Cli) -> Result<u8> {
                     export,
                     sort: args.sort,
                     parent_id: None,
+                    write: args.write,
+                    timeout: args.timeout,
                 },
+                actor,
+            )
+            .await?
+        }
+        Command::Explain(args) => {
+            let sql = read_sql_from(args.sql.as_deref(), args.file.as_deref())?;
+            schema::explain(
+                &engine,
+                &args.connection,
+                &sql,
+                args.timeout,
+                args.format,
                 actor,
             )
             .await?
@@ -565,6 +659,12 @@ async fn run(cli: Cli) -> Result<u8> {
                     export: None,
                     sort: Vec::new(),
                     parent_id: None,
+                    // Reading the log is a read. Saying so explicitly rather than
+                    // leaving it to a default is the point: `@audit` is `read_only`, so
+                    // a write here would be denied, and that is exactly what should
+                    // happen (see the test that tries one).
+                    write: false,
+                    timeout: None,
                 },
                 actor,
             )
@@ -585,6 +685,8 @@ async fn run(cli: Cli) -> Result<u8> {
                     export: None,
                     sort: Vec::new(),
                     parent_id: None,
+                    write: false,
+                    timeout: None,
                 },
                 actor,
             )
@@ -664,10 +766,14 @@ async fn verify(engine: &Engine, format: Format) -> Result<u8> {
 }
 
 fn read_sql(args: &QueryArgs) -> Result<String> {
-    if let Some(sql) = &args.sql {
-        return Ok(sql.clone());
+    read_sql_from(args.sql.as_deref(), args.file.as_deref())
+}
+
+fn read_sql_from(sql: Option<&str>, file: Option<&std::path::Path>) -> Result<String> {
+    if let Some(sql) = sql {
+        return Ok(sql.to_string());
     }
-    let path = args.file.as_ref().ok_or_else(|| {
+    let path = file.ok_or_else(|| {
         anyhow::anyhow!("no SQL given: pass it as an argument or with --file (`-` for stdin)")
     })?;
     if path.as_os_str() == "-" {
@@ -752,6 +858,7 @@ fn classify(e: &anyhow::Error) -> u8 {
         | Some(quokka_core::CoreError::AuditFinishFailed { .. })
         | Some(quokka_core::CoreError::IntrospectNotRecorded { .. })
         | Some(quokka_core::CoreError::Audit(_)) => exit::AUDIT_FAILED,
+        Some(quokka_core::CoreError::Denied { .. }) => exit::DENIED,
         Some(quokka_core::CoreError::Driver(_)) => exit::QUERY_FAILED,
         _ => exit::USAGE,
     }
@@ -760,10 +867,25 @@ fn classify(e: &anyhow::Error) -> u8 {
 fn report_error(e: &anyhow::Error, as_json: bool) {
     if as_json {
         let chain: Vec<String> = e.chain().map(|c| c.to_string()).collect();
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "error": e.to_string(),
             "causes": chain,
         });
+        // A denial carries its machine-readable code, so a script can branch on *why* it
+        // was refused without matching on prose. The same code is in the log's
+        // `error_code` column for the same query.
+        if let Some(quokka_core::CoreError::Denied {
+            code,
+            connection,
+            query_id,
+            ..
+        }) = e.downcast_ref::<quokka_core::CoreError>()
+        {
+            payload["denied"] = serde_json::json!(true);
+            payload["code"] = serde_json::json!(code);
+            payload["connection"] = serde_json::json!(connection);
+            payload["query_id"] = serde_json::json!(query_id.to_string());
+        }
         eprintln!("{payload}");
     } else {
         eprintln!("error: {e}");

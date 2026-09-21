@@ -1,0 +1,18 @@
+[package]
+name = "quokka-policy"
+description = "QuokkaQuery's policy engine: sqlparser classification and the guardrails every statement passes before it runs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The security boundary, and deliberately the thinnest manifest in the workspace. It is
+# a library of pure functions over SQL and a dialect (ARCHITECTURE §6.3), so it has no
+# async runtime, no database, no filesystem and no log — nothing it could reach even if
+# a future change wanted to. `serde` is here only because `Dialect` is serialized by the
+# surfaces above.
+[dependencies]
+serde.workspace = true
+sqlparser.workspace = true

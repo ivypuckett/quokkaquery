@@ -40,6 +40,13 @@ impl Workspace {
                  mode = \"read_write\"\n\
                  credential = \"none\"\n\
                  \n\
+                 # The same file, read-only: the default posture, and the one a\n\
+                 # denial is asserted against.\n\
+                 [connections.app-ro]\n\
+                 driver = \"sqlite\"\n\
+                 path = {:?}\n\
+                 credential = \"none\"\n\
+                 \n\
                  [connections.app-full]\n\
                  driver = \"sqlite\"\n\
                  path = {:?}\n\
@@ -55,6 +62,7 @@ impl Workspace {
                  user = \"reader\"\n\
                  credential = \"env:QUOKKA_TEST_PASSWORD\"\n\
                  connect_timeout = \"1s\"\n",
+                app_db.to_string_lossy(),
                 app_db.to_string_lossy(),
                 app_db.to_string_lossy()
             ),
@@ -284,15 +292,18 @@ async fn max_rows_truncates_and_never_does_so_silently() {
 async fn a_failing_query_exits_one_and_is_still_logged() {
     let w = Workspace::new().await;
 
+    // A statement the classifier reads perfectly well and the database refuses, so the
+    // failure under test is the query's rather than the guardrail's — those exit
+    // differently now, and on purpose (§6.1).
     let out = w.quokka(&[
         "query",
         "--connection",
         "app",
-        "SELEKT 1",
+        "SELECT * FROM no_such_table",
         "--format",
         "json",
     ]);
-    assert_eq!(code(&out), 1);
+    assert_eq!(code(&out), 1, "stderr: {}", stderr(&out));
     let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
     assert_eq!(envelope["status"], "error");
 
@@ -334,8 +345,14 @@ async fn the_audit_connection_cannot_be_written_through() {
         "UPDATE audit_log SET actor_id = 'mallory'",
         "DROP TABLE audit_log",
     ] {
-        let out = w.quokka(&["query", "--connection", "@audit", sql]);
-        assert_eq!(code(&out), 1, "{sql} should have been refused");
+        // `--write` and all: `@audit` is `read_only` and the opt-in cannot widen that.
+        let out = w.quokka(&["query", "--connection", "@audit", sql, "--write"]);
+        assert_eq!(
+            code(&out),
+            6,
+            "{sql} should have been denied: {}",
+            stderr(&out)
+        );
     }
 
     let out = w.quokka(&["audit", "verify"]);
@@ -659,7 +676,7 @@ async fn connections_list_names_every_connection_without_connecting_to_any() {
         .iter()
         .map(|c| c["name"].as_str().expect("name"))
         .collect();
-    assert_eq!(names, ["@audit", "app", "app-full", "prod"]);
+    assert_eq!(names, ["@audit", "app", "app-full", "app-ro", "prod"]);
 
     // `prod` points at a closed port. Listing it succeeded, so nothing dialled it — and
     // the log agrees, because nothing reached a database to log.
@@ -793,6 +810,7 @@ async fn no_result_data_reaches_the_log_after_an_export() {
         "INSERT INTO orders (id, email, total) VALUES (99, ?, 1.0)",
         "--param",
         &format!("text:{NEEDLE}"),
+        "--write",
     ]);
     assert_eq!(code(&seed), 0, "stderr: {}", stderr(&seed));
 
@@ -1215,6 +1233,7 @@ async fn a_part_written_export_logs_the_rows_that_reached_the_file() {
         "app",
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
          INSERT INTO orders (id, email, total) SELECT i + 1000, 'x@y.example', i FROM n",
+        "--write",
     ]);
     assert_eq!(code(&seed), 0, "stderr: {}", stderr(&seed));
 
