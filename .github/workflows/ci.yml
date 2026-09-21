@@ -37,7 +37,12 @@ jobs:
 
       # Deliberately *not* --all-features: that would switch on quokka-driver's
       # `docker-tests`, and CLAUDE.md says the default `cargo test` must pass with no
-      # Docker. Every driver is still built, because the CLI depends on all three.
+      # Docker. Every driver is still built, because the CLI depends on all four.
+      #
+      # This includes the Athena driver and its recorded fixtures (§9): they replay
+      # JSON over a listener on loopback, so they need no Docker, no network and no AWS
+      # credentials — which is the whole point of them, and the reason they are not in
+      # a job of their own.
       - name: cargo test
         run: cargo test --workspace
 
@@ -77,6 +82,66 @@ jobs:
       # to set up here.
       - name: cargo test --features docker-tests
         run: cargo test --package quokka-driver --features docker-tests
+
+  athena:
+    name: the Athena driver, and the build dependency it must not add
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # §8 says the C compiler `sqlx-sqlite` needs is the only build dependency, and M4
+      # confirmed the window adds none. The AWS SDK is the first dependency that could
+      # put a C toolchain back: every `aws-sdk-*` crate defaults to `rustls-aws-lc`,
+      # which pulls `aws-lc-sys` — C *and* cmake. The workspace takes them with
+      # `default-features = false` and builds the HTTPS client over rustls+ring
+      # instead, which is the stack sqlx already carries.
+      #
+      # Checked rather than claimed, the way M4 did the licence audit. This guard is
+      # what stops a casual `default-features = true` reinstating cmake for everyone.
+      - name: no aws-lc-sys, and no new -sys crate, in the default tree
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --package quokkaquery --edges normal)
+          if grep -Eiq '\b(aws-lc-sys|aws-lc-rs|aws-lc-fips-sys|s2n-tls-sys)\b' <<<"$tree"; then
+            echo "::error::a C-linking TLS stack reached the tree; Athena must use rustls+ring:"
+            grep -Ei '\b(aws-lc-sys|aws-lc-rs|aws-lc-fips-sys|s2n-tls-sys)\b' <<<"$tree"
+            exit 1
+          fi
+          # The complete list of `-sys` crates §8 accounts for. A new one is not
+          # necessarily wrong, but it is a change to the documented build dependencies,
+          # so it has to be a decision rather than a surprise.
+          expected="dirs-sys libsqlite3-sys linux-raw-sys renderdoc-sys wayland-sys"
+          found=$(cargo tree --package quokkaquery --edges normal --prefix none \
+            | awk '{print $1}' | grep -E -- '-sys$' | sort -u || true)
+          for crate in $found; do
+            case " $expected " in
+              *" $crate "*) ;;
+              *)
+                echo "::error::a -sys crate appeared that §8 does not account for: $crate"
+                exit 1
+                ;;
+            esac
+          done
+          echo "no new -sys crate; §8's build-dependency list still holds"
+
+      # The driver is behind its own cargo feature like every other one (§3.0, hedge 2),
+      # so a build that asks for Athena alone has to work — the slim build the hedge
+      # exists for.
+      - name: quokka-driver with athena alone
+        run: cargo test --package quokka-driver --no-default-features --features athena
+
+      # And a build that does *not* ask for it carries none of the AWS SDK.
+      - name: without the feature, no AWS SDK at all
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --package quokka-driver --no-default-features --features sqlite --edges normal)
+          if grep -Eiq '\b(aws-config|aws-sdk-athena|aws-smithy)' <<<"$tree"; then
+            echo "::error::the AWS SDK reached a build that did not ask for Athena:"
+            grep -Ei '\b(aws-config|aws-sdk-athena|aws-smithy)' <<<"$tree"
+            exit 1
+          fi
+          echo "one crate and one cargo feature per driver, still true"
 
   mcp:
     name: the MCP server speaks the protocol
@@ -256,7 +321,14 @@ jobs:
               exit 1
             fi
           done
-          echo "headless tree carries sqlite, postgres and mysql"
+          # Athena is not a sqlx driver, so it is checked by the crate it is built on.
+          # A headless container is exactly where querying Athena is most useful, so
+          # dropping the GUI stack must not drop it.
+          if ! grep -q "aws-sdk-athena" <<<"$tree"; then
+            echo "::error::the headless build dropped the athena driver"
+            exit 1
+          fi
+          echo "headless tree carries sqlite, postgres, mysql and athena"
 
   window:
     name: the window opens and runs a query

@@ -31,6 +31,10 @@ uuid.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# A normal dependency of the library, and a dev-dependency too so that the tests can
+# build an `AuditEvent` by hand — which is how the chain test writes rows from the era
+# when the cost columns were always NULL.
+quokka-audit.workspace = true
 sqlx = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

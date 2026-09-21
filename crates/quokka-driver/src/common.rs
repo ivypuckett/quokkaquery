@@ -12,8 +12,17 @@
 // `cargo build -p quokka-driver --no-default-features`, which is a legitimate way to ask
 // "what does the trait seam cost on its own" — compiles to nothing rather than to a pile
 // of dead-code warnings.
-#![cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+#![cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "athena"
+))]
 
+// Athena has no parameter binding to share (its `ExecutionParameters` are textual
+// substitution, which `athena::execute` refuses), so a build with only that driver uses
+// nothing from here but the channel depth.
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use quokka_core::Value;
 
 /// How many rows may sit between a database and the consumer.

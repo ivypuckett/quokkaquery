@@ -60,6 +60,31 @@ fn outcome_json(outcome: &Outcome) -> Json {
     serde_json::to_value(outcome).unwrap_or(Json::Null)
 }
 
+/// What the query cost, for a reader that is a program (§6.1).
+///
+/// Absent rather than zero when the driver reported nothing: a script summing
+/// `data_scanned_bytes` across connections must not be handed a 0 that means "this
+/// driver does not measure it". `cost_estimate_usd` is deliberately never here — the
+/// rate is region-dependent and belongs to whoever reads the log, at the moment they
+/// ask (see the note in `quokka_core::execute`).
+fn cost_fields(envelope: &mut Map<String, Json>, outcome: &Outcome) {
+    if let Some(bytes) = outcome.data_scanned_bytes {
+        envelope.insert("data_scanned_bytes".into(), Json::from(bytes));
+        envelope.insert(
+            "data_scanned".into(),
+            Json::String(quokka_spool::bytes_scanned(bytes)),
+        );
+    }
+    if let Some(ms) = outcome.engine_time_ms {
+        envelope.insert("engine_time_ms".into(), Json::from(ms));
+    }
+    // A warning is a sentence composed by the policy engine and carried verbatim, so a
+    // script and a person read the same words the UI shows (§6.4).
+    if let Some(warning) = &outcome.cost_warning {
+        envelope.insert("cost_warning".into(), Json::String(warning.clone()));
+    }
+}
+
 /// One envelope, written when the query finishes.
 #[derive(Default)]
 struct JsonSink {
@@ -114,6 +139,7 @@ impl RowSink for JsonSink {
         envelope.insert("row_count".into(), Json::from(outcome.rows_returned));
         envelope.insert("truncated".into(), Json::Bool(outcome.truncated));
         spool_fields(&mut envelope, outcome, shown);
+        cost_fields(&mut envelope, outcome);
         envelope.insert("duration_ms".into(), Json::from(outcome.duration_ms));
         if let Some(n) = outcome.rows_affected {
             envelope.insert("rows_affected".into(), Json::from(n));
@@ -169,6 +195,7 @@ impl RowSink for NdjsonSink {
             }
         };
         spool_fields(&mut summary, outcome, self.rows_written);
+        cost_fields(&mut summary, outcome);
         let mut err = std::io::stderr().lock();
         serde_json::to_writer(&mut err, &Json::Object(summary))?;
         err.write_all(b"\n")?;
@@ -281,6 +308,12 @@ fn footer(outcome: &Outcome, rows_shown: usize) -> String {
         ));
     } else if outcome.truncated {
         parts.push("TRUNCATED at --max-rows; the result has more".to_string());
+    }
+    // §3.2's number, where the person who paid for it is looking. Rendered by
+    // `quokka-spool` rather than formatted here, so the footer, the MCP response and the
+    // window all say a size the same way (§9: the words live below the surface).
+    if let Some(bytes) = outcome.data_scanned_bytes {
+        parts.push(format!("{} scanned", quokka_spool::bytes_scanned(bytes)));
     }
     parts.push(format!("{} ms", outcome.duration_ms));
     parts.push(format!("query {}", outcome.query_id));

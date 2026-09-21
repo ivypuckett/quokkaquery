@@ -387,3 +387,164 @@ async fn the_log_cannot_be_written_from_the_window() {
     );
     assert!(h.intact().await);
 }
+
+// ---------------------------------------------------------------------------
+// M5: the cost guard at the window (§6.4)
+// ---------------------------------------------------------------------------
+
+/// A harness whose `app` connection carries a budget, and an agent that has spent it.
+///
+/// The spend is appended to the log directly because no SQLite query scans anything —
+/// `data_scanned_bytes` is Athena's column, and the budget sums it. What is under test
+/// is the refusal, not the arithmetic, which `quokka-core` tests against a driver that
+/// reports bytes.
+async fn budgeted_harness(spent: i64, kind: ActorKind) -> Harness {
+    let h = harness(3).await;
+
+    let guard = quokka_core::CostGuard {
+        window: std::time::Duration::from_secs(86_400),
+        agent_limit: Some(50_000_000_000),
+        human_limit: None,
+        human_warn: Some(500_000_000_000),
+    };
+
+    let audit_db = h.dir.path().join("audit.db");
+    let audit = AuditLog::open(&audit_db).await.expect("audit log");
+    audit
+        .append(quokka_audit::AuditEvent {
+            id: uuid::Uuid::now_v7(),
+            query_id: uuid::Uuid::now_v7(),
+            parent_id: None,
+            at: quokka_audit::now_rfc3339().expect("a timestamp"),
+            duration_ms: Some(1),
+            actor_kind: kind,
+            actor_id: "ivy".to_string(),
+            session_id: "seed".to_string(),
+            client: quokka_audit::Client::Ui,
+            connection: "app".to_string(),
+            dialect: "athena".to_string(),
+            database: None,
+            schema_name: None,
+            event_kind: EventKind::QueryFinished,
+            sql_logging: quokka_audit::SqlLogging::Fingerprint,
+            sql_text: None,
+            sql_fingerprint: "SELECT ?".to_string(),
+            statement_kind: Some("query".to_string()),
+            read_only: Some(true),
+            params: None,
+            status: Status::Ok,
+            error_code: None,
+            error_message: None,
+            rows_returned: Some(1),
+            rows_affected: None,
+            rows_spooled: None,
+            truncated: Some(false),
+            export_format: None,
+            export_path: None,
+            data_scanned_bytes: Some(spent),
+            cost_estimate_usd: None,
+            approved_by: None,
+            tags: None,
+        })
+        .await
+        .expect("append");
+
+    // The registry has to be rebuilt to carry the budget, over the same log and the same
+    // database file.
+    let mut registry = Registry::builtin_only(&audit_db);
+    registry.insert(ConnectionConfig {
+        path: Some(h.dir.path().join("app.db")),
+        mode: AccessMode::ReadWrite,
+        cost_guard: Some(guard),
+        ..ConnectionConfig::new("app", "sqlite")
+    });
+
+    let connections = work::connection_rows(&registry);
+    Harness {
+        session: Session {
+            engine: Arc::new(Engine::new(
+                registry,
+                audit,
+                quokka_driver::builtin_factories(),
+            )),
+            connections,
+            ..h.session
+        },
+        dir: h.dir,
+    }
+}
+
+/// **The parity test grows again, on the third surface.** A budget denial reads at the
+/// window exactly as it does from the CLI and from MCP — the same code, and the same
+/// sentence, because there is one place those words are composed and every surface
+/// renders it verbatim.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_denial_reads_the_same_at_the_window() {
+    let h = budgeted_harness(60_000_000_000, ActorKind::Agent).await;
+    let session = Session {
+        actor: Actor {
+            kind: ActorKind::Agent,
+            id: "ivy".to_string(),
+        },
+        ..h.session.clone()
+    };
+
+    let ran = work::run(
+        session,
+        "app".to_string(),
+        "SELECT * FROM orders".to_string(),
+        false,
+    )
+    .await;
+
+    let Ran::Denied { code, message, .. } = ran else {
+        panic!("an agent past its budget must be refused at the window too: {ran:?}");
+    };
+    assert_eq!(code, "policy.cost_budget");
+    // The same three facts the CLI's envelope and MCP's `data` carry.
+    assert!(message.contains("50 GB"), "the budget: {message}");
+    assert!(message.contains("1d"), "the window: {message}");
+    assert!(message.contains("60 GB"), "the spend: {message}");
+    assert!(
+        message.contains("cost_guard"),
+        "and where to change it, since only a human can: {message}"
+    );
+
+    // And it is the denial shape in the log: two events, the second `denied`.
+    let events = h.events().await;
+    let denials: Vec<_> = events
+        .iter()
+        .filter(|e| e.event.status == Status::Denied)
+        .collect();
+    assert_eq!(denials.len(), 1);
+    assert_eq!(denials[0].event.client, quokka_audit::Client::Ui);
+    assert!(h.intact().await);
+}
+
+/// The asymmetry, at the window: the same spend, the same connection, a human.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_spend_by_a_human_runs_and_warns() {
+    let h = budgeted_harness(600_000_000_000, ActorKind::Human).await;
+
+    let ran = work::run(
+        h.session.clone(),
+        "app".to_string(),
+        "SELECT * FROM orders".to_string(),
+        false,
+    )
+    .await;
+
+    let Ran::Loaded(loaded) = ran else {
+        panic!("an uncapped human is never refused by the agent cap: {ran:?}");
+    };
+    let warning = loaded
+        .outcome
+        .cost_warning
+        .as_deref()
+        .expect("past human_warn, the window has a sentence to show");
+    assert!(warning.contains("600 GB"), "{warning}");
+    assert!(
+        warning.contains("after a query runs"),
+        "the warning must not imply a pre-execution estimate: {warning}"
+    );
+}

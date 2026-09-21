@@ -23,12 +23,15 @@ use quokka_audit::{
 };
 use uuid::Uuid;
 
-use quokka_policy::{AccessMode, Denial, Outcome as PolicyOutcome, Policy, SqlSummary};
+use quokka_policy::{
+    AccessMode, ActorClass, CostContext, Denial, Outcome as PolicyOutcome, Policy, SqlSummary,
+};
 
 use crate::catalog::CatalogCache;
 use crate::config::{dialect_hint, ConnectionConfig, Registry};
 use crate::driver::{
-    Catalog, Driver, DriverFactory, ExecutePermit, Plan, QueryHandle, QueryRequest, Scope,
+    Catalog, Driver, DriverFactory, ExecutePermit, MetaHandle, Plan, QueryHandle, QueryRequest,
+    ResultMeta, Scope,
 };
 use crate::error::{CoreError, DriverError};
 use crate::redact::scrub;
@@ -127,6 +130,28 @@ pub struct Outcome {
     /// growing, so `rows_spooled < rows_returned`.
     pub spool_capped: Option<Cap>,
     pub duration_ms: i64,
+    /// Bytes the engine reported scanning (§3.2). `None` when the driver reported none
+    /// — which is every driver but Athena today, and Athena itself when a query failed
+    /// before it scanned anything.
+    ///
+    /// **`None` and `Some(0)` are different answers and stay different all the way into
+    /// the log.** Zero is a real number on Athena: a query answered from the result
+    /// cache, or one that only read partition metadata, scanned nothing and was
+    /// charged for nothing. Writing 0 where nothing was reported would make a Postgres
+    /// query look like a free Athena one.
+    pub data_scanned_bytes: Option<i64>,
+    /// How long the engine says it spent executing, as distinct from `duration_ms`,
+    /// which is the wall clock this process saw — queueing, polling and paging
+    /// included.
+    pub engine_time_ms: Option<i64>,
+    /// What that scan cost, in dollars. **Always `None` in this build**, deliberately:
+    /// see `cost_estimate_usd` in the note on [`execute`].
+    pub cost_estimate_usd: Option<f64>,
+    /// The sentence a surface shows when this caller is past a warning threshold but
+    /// under its limit (§6.4). Rendered verbatim, so the words are the same in all
+    /// three surfaces — the policy engine composed them, and it is the only place they
+    /// exist.
+    pub cost_warning: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
 }
@@ -352,15 +377,31 @@ pub async fn execute(
     let max_rows = cfg.limits.cap_rows(request.max_rows);
     let timeout = cfg.limits.cap_timeout(request.timeout);
 
+    // §6.4's cumulative budget needs to know what this actor has already spent, and the
+    // policy engine may not find out for itself — it is a crate of pure functions and
+    // opening a database from it would put I/O below `execute()` in the dependency
+    // graph. So the gathering happens here, in the crate that already holds the log,
+    // and the answer travels into `decide` as a number. Nothing is read at all for a
+    // connection with no `cost_guard`, which is every connection by default.
+    let cost = cost_context(engine, &cfg, &request.actor).await;
+
     // The verdict is computed before `query_started` is written and acted on after, so
     // that a denial is recorded rather than merely returned. The `approved_by` column
     // needs the answer for the row it is about to write.
-    let verdict = policy_for(&cfg, &request).decide(&summary);
+    let verdict = policy_for(&cfg, &request, cost).decide(&summary);
     let approved_by = match &verdict {
         // Who turned the second key. The *authorization* is the connection's mode, which
         // only a human can set; this names the caller that opted in, which together with
         // `client` and `actor_id` is what a reviewer asking "who ran this write" wants.
-        PolicyOutcome::Allow { writes: true } => Some(request.actor.id.clone()),
+        PolicyOutcome::Allow { writes: true, .. } => Some(request.actor.id.clone()),
+        _ => None,
+    };
+    // Composed by `quokka-policy` and carried verbatim, so a cost warning reads the
+    // same from the CLI, from MCP and from the window — the same rule a denial follows.
+    let cost_warning = match &verdict {
+        PolicyOutcome::Allow {
+            warning: Some(w), ..
+        } => Some(w.message(&cfg.name)),
         _ => None,
     };
 
@@ -402,6 +443,10 @@ pub async fn execute(
         truncated: None,
         export_format: None,
         export_path: None,
+        // NULL on a start, and not because the wire is missing: nothing has been
+        // scanned yet. Athena reports `DataScannedInBytes` when an execution reaches a
+        // terminal state, which is after this row is on disk — the same asymmetry that
+        // makes §6.4's budget stop the query *after* the one that crossed the line.
         data_scanned_bytes: None,
         cost_estimate_usd: None,
         approved_by: approved_by.clone(),
@@ -431,32 +476,27 @@ pub async fn execute(
     .await;
     let duration_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
 
-    let (status, error_code, error_message, columns, rows_returned, rows_affected, truncated) =
-        match run {
-            Ok(done) => (
-                Status::Ok,
-                None,
-                None,
-                done.columns,
-                done.rows_returned,
-                done.rows_affected,
-                done.truncated,
-            ),
-            Err(RunFailure {
-                status,
-                code,
-                message,
-                partial,
-            }) => (
-                status,
-                Some(code),
-                Some(message),
-                partial.columns,
-                partial.rows_returned,
-                partial.rows_affected,
-                partial.truncated,
-            ),
-        };
+    let (status, error_code, error_message, partial) = match run {
+        Ok(done) => (Status::Ok, None, None, done),
+        Err(RunFailure {
+            status,
+            code,
+            message,
+            partial,
+        }) => (status, Some(code), Some(message), partial),
+    };
+    // Read once, after the stream has been dropped, so a driver that publishes its
+    // totals on the way out has published them. A query that failed is included on
+    // purpose: an Athena execution that errored still reports what it scanned, and the
+    // bill arrives either way.
+    let meta = partial.meta();
+    let Partial {
+        columns,
+        rows_returned,
+        rows_affected,
+        truncated,
+        ..
+    } = partial;
 
     // Asked before `end()`, because the answer belongs in the outcome that `end()` is
     // handed — and in the log below.
@@ -473,6 +513,14 @@ pub async fn execute(
         rows_spooled: retained.map(|r| r.rows),
         spool_capped: retained.and_then(|r| r.capped),
         duration_ms,
+        // Straight from what the driver reported, never invented. A driver that
+        // reported nothing leaves NULL here and NULL in the log; nothing fills in a 0
+        // to make the column look populated.
+        data_scanned_bytes: meta.data_scanned_bytes,
+        engine_time_ms: meta.engine_time_ms,
+        // Deliberately never computed. See the note on `execute`.
+        cost_estimate_usd: None,
+        cost_warning: cost_warning.clone(),
         error_code,
         error_message,
     };
@@ -519,7 +567,34 @@ pub async fn execute(
         truncated: Some(outcome.is_partial()),
         export_format: None,
         export_path: None,
-        data_scanned_bytes: None,
+        // The wire §3.2 promised and M0–M4 left `None`. Whatever the driver reported,
+        // and nothing when it reported nothing: the column is `NULL` for a driver that
+        // does not measure this, which is every driver but Athena today.
+        //
+        // No column was added and no chain was broken doing this — `data_scanned_bytes`
+        // and `cost_estimate_usd` have been in `audit_log` and in `row_hash`'s field
+        // list since M0. Every row written before this commit hashed them as NULL and
+        // still verifies; every row after hashes whatever is here.
+        data_scanned_bytes: outcome.data_scanned_bytes,
+        // **Left NULL on purpose, and this is the decision rather than an omission.**
+        // The only way to fill it is a price per byte, and Athena's is a
+        // region-dependent list price ($5/TB in most regions, other numbers elsewhere)
+        // that Amazon changes without asking us. A rate compiled into this binary would
+        // be wrong for some readers the day it shipped and wrong for everyone
+        // eventually — and it would be wrong *silently*, sitting in an append-only
+        // table beside an exact byte count, impossible to correct without breaking the
+        // chain. A stale number that cannot be edited is worse than a NULL next to a
+        // measurement.
+        //
+        // So the byte count is recorded and the arithmetic belongs to whoever reads the
+        // log, at the rate that applies to them, at the moment they ask — which is
+        // exactly how §5's own example query does it:
+        //
+        //     SELECT actor_id, sum(data_scanned_bytes)/1e12 * 5 AS usd FROM audit_log …
+        //
+        // The column stays in the schema and in the hash: filling it is a later
+        // decision (a configured rate, per connection) that this one does not foreclose.
+        // Nothing in the cost guard needs it — §6.4's budget is denominated in bytes.
         cost_estimate_usd: None,
         approved_by,
         tags: request.tags.clone(),
@@ -647,6 +722,11 @@ pub async fn explain(
         write_requested: false,
         allow: &cfg.allow,
         default_schema: cfg.schema.as_deref(),
+        // No budget check on an `EXPLAIN`. Athena's `EXPLAIN` plans a statement rather
+        // than running it, so it scans nothing and adds nothing to a bill — and
+        // refusing to *look at* a plan because the budget is spent would deny the one
+        // thing that helps someone spend less next time.
+        cost: None,
     };
     let verdict = policy.decide(&summary);
 
@@ -977,6 +1057,21 @@ struct Partial {
     rows_returned: u64,
     rows_affected: Option<i64>,
     truncated: bool,
+    /// What the driver published as it drained (§2.1) — bytes scanned, engine time.
+    ///
+    /// The *handle* rather than a snapshot, because the numbers arrive at different
+    /// moments and every exit path below wants the latest: Athena knows its
+    /// `DataScannedInBytes` the moment the execution reaches a terminal state, which is
+    /// before the first row and also true of an execution that failed. A query that
+    /// errored halfway still scanned what it scanned, and the bill does not care that
+    /// the rows never arrived.
+    meta: Option<MetaHandle>,
+}
+
+impl Partial {
+    fn meta(&self) -> ResultMeta {
+        self.meta.as_ref().map(|m| m.snapshot()).unwrap_or_default()
+    }
 }
 
 struct RunFailure {
@@ -1049,6 +1144,10 @@ async fn run_query(
 
     let mut partial = Partial {
         columns: stream.columns.clone(),
+        // Captured here, before a single row is read, so that every `return` below —
+        // an error mid-stream, a deadline, a sink that would not take a row — carries
+        // whatever the driver had published by then.
+        meta: Some(stream.meta.clone()),
         ..Partial::default()
     };
 
@@ -1114,7 +1213,11 @@ async fn until<F: std::future::Future>(
 /// Assembled here, inside `execute()`, rather than passed in by a surface — a guardrail
 /// a surface could assemble differently is one that binds the surfaces differently, and
 /// invariant 9 says it binds them identically.
-fn policy_for<'a>(cfg: &'a ConnectionConfig, request: &'a ExecuteRequest) -> Policy<'a> {
+fn policy_for<'a>(
+    cfg: &'a ConnectionConfig,
+    request: &'a ExecuteRequest,
+    cost: Option<CostContext>,
+) -> Policy<'a> {
     Policy {
         // Both, unmixed: `Policy` narrows them itself, and keeping them apart is what
         // lets a denial name whichever one said no.
@@ -1123,6 +1226,71 @@ fn policy_for<'a>(cfg: &'a ConnectionConfig, request: &'a ExecuteRequest) -> Pol
         write_requested: request.write,
         allow: &cfg.allow,
         default_schema: cfg.schema.as_deref(),
+        cost,
+    }
+}
+
+/// Gather what this actor has spent on this connection inside the budget's window.
+///
+/// **Which is to say: the budget binds a (connection, actor) pair.** §6.4's TOML puts
+/// the block under a connection and the limits under actor kinds, which is a shape
+/// rather than an answer to "one agent, three connections", so here is the answer and
+/// why. The block is a *connection's* configuration, written by the human who
+/// configured that connection; summing an agent's spend across connections would let
+/// one connection's budget be exhausted by traffic its owner never authorized and
+/// cannot see, and would make a limit mean something different depending on what else
+/// is in the config file. So three connections with a 50 GB agent cap are three 50 GB
+/// caps, and an agent working across all three can scan 150 GB in a day. That is worth
+/// stating plainly rather than discovering: this shape cannot express a global budget,
+/// and pretending otherwise would be the more dangerous error, because the person
+/// would believe in a cap that was never there.
+///
+/// Within a connection it is per *actor id*, not per actor kind: two agents each get
+/// their own budget, which is what makes "which agent burned it" answerable. The kind
+/// only chooses which limit applies.
+///
+/// A failure to read returns `spend: None`, which [`quokka_policy::Denial`] turns into
+/// a refusal rather than into a zero. The reasoning is on `CostSpendUnknown`.
+async fn cost_context(
+    engine: &Engine,
+    cfg: &ConnectionConfig,
+    actor: &Actor,
+) -> Option<CostContext> {
+    let guard = cfg.cost_guard?;
+
+    // `None` either way — a log that cannot be read and a window that cannot be
+    // computed are the same answer to the same question, and neither is a zero. A clock
+    // this process cannot format is not a reason to let a budget lapse.
+    let spend = match window_start(guard.window) {
+        Ok(since) => engine
+            .audit
+            .data_scanned_since(&cfg.name, &actor.id, actor.kind, &since)
+            .await
+            .ok(),
+        Err(_) => None,
+    };
+
+    Some(CostContext {
+        guard,
+        actor: actor_class(actor.kind),
+        spend,
+    })
+}
+
+/// The `at` value the window starts at, in the form the column stores.
+fn window_start(window: Duration) -> Result<String, time::error::Format> {
+    let start = time::OffsetDateTime::now_utc() - window;
+    start.format(&time::format_description::well_known::Rfc3339)
+}
+
+/// Which cap applies (§6.4).
+///
+/// `automation` is capped as an agent, because the question the budget asks is whether
+/// anyone is watching, and a cron job at 3am is no more awake than an agent is.
+fn actor_class(kind: ActorKind) -> ActorClass {
+    match kind {
+        ActorKind::Human => ActorClass::Human,
+        ActorKind::Agent | ActorKind::Automation => ActorClass::Agent,
     }
 }
 

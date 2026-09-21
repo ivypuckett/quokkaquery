@@ -360,6 +360,8 @@ async fn read_meta(pool: &SqlitePool) -> Result<Meta, SpoolError> {
         truncated_by_max_rows: get(MetaKey::TruncatedByMaxRows).as_deref() == Some("true"),
         query_duration_ms: get(MetaKey::QueryDurationMs).and_then(|s| s.parse().ok()),
         status: get(MetaKey::Status),
+        data_scanned_bytes: get(MetaKey::DataScannedBytes).and_then(|s| s.parse().ok()),
+        engine_time_ms: get(MetaKey::EngineTimeMs).and_then(|s| s.parse().ok()),
     })
 }
 

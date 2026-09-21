@@ -696,6 +696,21 @@ fn finished(state: &mut State, ran: Ran) -> Task<Message> {
             let evicted = state.slots.open(id);
             state.tabs.insert(id, tab);
 
+            // §6.4's warning, rendered verbatim like a denial: the words are the policy
+            // engine's, so the window, the CLI and MCP say the same thing. A person
+            // watching a spend climb should read the same sentence wherever they are.
+            if let Some(warning) = &state.tabs[&id].outcome.cost_warning {
+                state.notice = Some(Notice {
+                    kind: NoticeKind::Denied,
+                    text: warning.clone(),
+                    detail: Some(
+                        "a warning, not a refusal \u{2014} this query ran. The threshold is \
+                         `human_warn` under [cost_guard] in the config file."
+                            .to_string(),
+                    ),
+                });
+            }
+
             match evicted.and_then(|id| state.tabs.remove(&id)) {
                 Some(old) => {
                     state.notice = Some(Notice::info(format!(
@@ -721,10 +736,19 @@ fn finished(state: &mut State, ran: Ran) -> Task<Message> {
                     .unwrap_or_else(|| format!("the query on {connection} did not finish")),
             );
             notice.detail = outcome.error_code.clone().map(|code| {
-                format!(
+                let mut detail = format!(
                     "{code} \u{b7} recorded in the audit log as {}",
                     outcome.status
-                )
+                );
+                // A query that failed can still have been paid for. Saying so here is
+                // the only place a person would find out before the invoice.
+                if let Some(bytes) = outcome.data_scanned_bytes {
+                    detail.push_str(&format!(
+                        " \u{b7} {} scanned before it stopped",
+                        quokka_spool::bytes_scanned(bytes)
+                    ));
+                }
+                detail
             });
             state.notice = Some(notice);
             Task::none()

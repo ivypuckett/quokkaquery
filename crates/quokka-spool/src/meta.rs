@@ -1,8 +1,10 @@
 //! The `meta` table: row count, truncation and timings (§4).
 //!
-//! Keys rather than columns, because what belongs here grows: M4 wants the creation
-//! time to render "as of 10:00 (45m ago)", M5 will want Athena's bytes scanned, and a
-//! key/value table absorbs both without a migration on a file that lives for minutes.
+//! Keys rather than columns, because what belongs here grows: M4 wanted the creation
+//! time to render "as of 10:00 (45m ago)", M5 wanted Athena's bytes scanned, and a
+//! key/value table absorbed both without a migration on a file that lives for minutes.
+//! (That is this file's own note from M4, and it turned out to be the whole of M5's
+//! spool change: two keys and nothing else.)
 //!
 //! What is *not* here is any part of a row. The spool holds the result; `meta` describes
 //! it.
@@ -31,6 +33,11 @@ pub enum MetaKey {
     QueryDurationMs,
     /// How the query ended.
     Status,
+    /// Bytes the engine reported scanning (§3.2). Absent when the driver reported none,
+    /// which is a different thing from zero — see [`Meta::data_scanned_bytes`].
+    DataScannedBytes,
+    /// How long the engine says it spent executing, as distinct from the wall clock.
+    EngineTimeMs,
 }
 
 impl MetaKey {
@@ -45,6 +52,8 @@ impl MetaKey {
             MetaKey::RowsReturned => "rows_returned",
             MetaKey::QueryDurationMs => "query_duration_ms",
             MetaKey::Status => "status",
+            MetaKey::DataScannedBytes => "data_scanned_bytes",
+            MetaKey::EngineTimeMs => "engine_time_ms",
         }
     }
 }
@@ -92,6 +101,18 @@ pub fn entries_for(
             cap.as_str().to_string(),
         ));
     }
+    // Written only when the driver reported them. An absent key and a `0` are different
+    // answers all the way down: zero is what a cached Athena result scanned, and a
+    // Postgres query that measures nothing must not be made to look like one.
+    if let Some(bytes) = outcome.data_scanned_bytes {
+        entries.push((
+            MetaKey::DataScannedBytes.as_str().to_string(),
+            bytes.to_string(),
+        ));
+    }
+    if let Some(ms) = outcome.engine_time_ms {
+        entries.push((MetaKey::EngineTimeMs.as_str().to_string(), ms.to_string()));
+    }
     entries
 }
 
@@ -112,6 +133,13 @@ pub struct Meta {
     pub truncated_by_max_rows: bool,
     pub query_duration_ms: Option<i64>,
     pub status: Option<String>,
+    /// Bytes the engine reported scanning, when it reported any (§3.2).
+    ///
+    /// `None` means the driver does not measure this, not that the query was free. The
+    /// pager renders it, which is why it lives here: the words above a result grid are
+    /// tested where the numbers are, not inside a `view` function (§9).
+    pub data_scanned_bytes: Option<i64>,
+    pub engine_time_ms: Option<i64>,
 }
 
 impl Meta {

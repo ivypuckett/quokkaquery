@@ -22,6 +22,10 @@
 //! 4. **An optional per-connection allowlist** of schemas and tables.
 //! 5. **Server-side caps** on rows and time ([`Limits`]), which a request may lower and
 //!    never raise.
+//! 6. **A cumulative cost budget** per actor over a rolling window ([`CostGuard`], §6.4).
+//!    The spend is *gathered by the caller* and passed in as a value — see the note at
+//!    the top of `cost.rs`, because that constraint is the whole reason this crate can
+//!    stay a library of pure functions.
 //!
 //! ## Parsing is not classification, and a parse failure is a decision
 //!
@@ -61,9 +65,13 @@
 //! is weaker in the safe direction.
 
 mod analyze;
+mod cost;
 mod dialect;
 mod policy;
 
 pub use analyze::{summarize, SqlSummary, TableRef, UNFINGERPRINTABLE};
+pub use cost::{
+    bytes as cost_bytes, window as cost_window, ActorClass, CostContext, CostGuard, CostWarning,
+};
 pub use dialect::Dialect;
 pub use policy::{AccessMode, Allowlist, Denial, Limits, Outcome, Policy};

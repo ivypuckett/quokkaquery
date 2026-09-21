@@ -117,6 +117,24 @@ impl CredentialRef {
         }
     }
 
+    /// The default for a connection whose driver keeps its credentials elsewhere.
+    ///
+    /// One driver does: Athena authenticates through the AWS SDK's own chain — an
+    /// `sso_session` profile in `~/.aws/config` and the token cache `aws sso login`
+    /// writes — so there is no secret for QuokkaQuery to hold. This module is about
+    /// secrets *QuokkaQuery stores*, and an SSO token cache belongs to the AWS CLI: it
+    /// is refreshed by a tool we do not run, expires on a schedule we do not set, and
+    /// would be the one keyring entry `quokka credential set` could not fill. So the
+    /// AWS profile is an ordinary connection field (`profile = "…"`) and the credential
+    /// reference is [`CredentialRef::None`], rather than a fourth variant here that
+    /// would mean "look somewhere this crate cannot look".
+    pub fn for_driver(driver: &str, connection: &str) -> Self {
+        match driver {
+            "athena" => CredentialRef::None,
+            _ => CredentialRef::default_for(connection),
+        }
+    }
+
     /// Parse the `credential = "..."` setting.
     pub fn parse(text: &str, connection: &str) -> Result<Self, CredentialError> {
         let text = text.trim();

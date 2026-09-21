@@ -1,6 +1,6 @@
 //! The sentence a result tab puts above its rows (ARCHITECTURE §7).
 //!
-//! > `rows 1–512 of 12,481 · as of 10:00 (45m ago) · [Next] [Re-run] [Export all]`
+//! > `rows 1–512 of 12,481 · 1.2 GB scanned · as of 10:00 (45m ago) · [Next] [Re-run]`
 //!
 //! The words are here rather than in an iced `view` function for §9's reason: logic
 //! inside a widget is logic that cannot be tested, and every number in that line is one
@@ -49,6 +49,18 @@ pub struct Pager {
     pub age: Option<Duration>,
     /// True once [`Pager::age`] is past `spool_stale_after`.
     pub stale: bool,
+    /// Bytes the engine reported scanning for this result (§3.2, §6.4).
+    ///
+    /// **Here rather than in a `view` function**, for the reason the rest of this file
+    /// exists: M4 put the pager's words in `quokka-spool` because that is where they can
+    /// be table-tested, and bytes scanned belongs beside them. It is the number a person
+    /// looking at an Athena result most wants and is least able to work out — the one
+    /// that says what the query on screen cost.
+    ///
+    /// `None` when the driver reported none, which is every driver but Athena. A result
+    /// that genuinely scanned nothing reports `Some(0)` and says "0 bytes scanned",
+    /// because on Athena that is worth knowing: it means the result came from the cache.
+    pub data_scanned_bytes: Option<i64>,
 }
 
 impl Pager {
@@ -88,17 +100,32 @@ impl Pager {
                 (Some(age), Some(limit)) => age >= limit,
                 _ => false,
             },
+            data_scanned_bytes: meta.data_scanned_bytes,
         }
     }
 
-    /// `rows 1–512 of 12,481 · as of 10:00 (45m ago)`.
+    /// `rows 1–512 of 12,481 · 1.2 GB scanned · as of 10:00 (45m ago)`.
     pub fn line(&self) -> String {
         let mut line = self.rows_phrase();
+        if let Some(scanned) = self.scanned_phrase() {
+            line.push_str(" · ");
+            line.push_str(&scanned);
+        }
         if let Some(freshness) = self.freshness() {
             line.push_str(" · ");
             line.push_str(&freshness);
         }
         line
+    }
+
+    /// `1.2 GB scanned`, or nothing at all when the driver does not measure it.
+    ///
+    /// Said plainly rather than as a currency: the rate is region-dependent and changes,
+    /// so the log stores bytes and this reports bytes. A person who knows their rate can
+    /// multiply; a number that was wrong when it was written cannot be corrected.
+    pub fn scanned_phrase(&self) -> Option<String> {
+        let bytes = self.data_scanned_bytes?;
+        Some(format!("{} scanned", bytes_scanned(bytes)))
     }
 
     /// `rows 1–512 of 12,481`, or `no rows` when the view selects none.
@@ -133,6 +160,20 @@ impl Pager {
         }
         Some(text)
     }
+}
+
+/// `1234567` → `1.2 MB`. Decimal units, because that is how the bill is denominated
+/// (`$5 per TB` means 10^12 bytes) and how `[cost_guard]` writes its limits.
+///
+/// Shared with the cost guard's own messages: this is `quokka_policy::CostGuard`'s
+/// spelling, re-exported rather than written twice, so a warning and the line above the
+/// grid say the same size the same way.
+pub fn bytes_scanned(bytes: i64) -> String {
+    if bytes < 0 {
+        // Nothing should produce this; saying so beats rendering a negative size.
+        return "an unknown amount".to_string();
+    }
+    quokka_core::cost_bytes(bytes as u64)
 }
 
 /// `45m`, `2h 05m`, `3d`. Coarse on purpose: the question a result tab answers is "is
@@ -186,6 +227,8 @@ mod tests {
             truncated_by_max_rows: false,
             query_duration_ms: Some(120),
             status: Some("ok".to_string()),
+            data_scanned_bytes: None,
+            engine_time_ms: None,
         }
     }
 
@@ -246,6 +289,57 @@ mod tests {
         assert_eq!(
             pager.freshness().as_deref(),
             Some("as of 10:00 (2h 31m ago) — stale")
+        );
+    }
+
+    /// §3.2's number, in the line a person actually reads. The one thing an Athena user
+    /// most wants to know about the result on screen is what it cost.
+    #[test]
+    fn an_athena_result_says_what_it_scanned() {
+        let mut m = meta("2026-05-04T10:00:00Z");
+        m.data_scanned_bytes = Some(1_234_567_890);
+        let pager = Pager::new(
+            &page(512, 0, true),
+            12_481,
+            &m,
+            datetime!(2026-05-04 10:00:30 UTC),
+            None,
+        );
+        assert_eq!(
+            pager.line(),
+            "rows 1–512 of 12,481 · 1.2 GB scanned · as of 10:00 (30s ago)"
+        );
+    }
+
+    /// Zero is an answer on Athena — a result served from the cache scanned nothing and
+    /// cost nothing — so it is said rather than hidden. A driver that reports *no*
+    /// number says nothing at all, which is a different line.
+    #[test]
+    fn nothing_scanned_and_nothing_reported_read_differently() {
+        let mut free = meta("2026-05-04T10:00:00Z");
+        free.data_scanned_bytes = Some(0);
+        let pager = Pager::new(
+            &page(1, 0, false),
+            1,
+            &free,
+            datetime!(2026-05-04 10:00:01 UTC),
+            None,
+        );
+        assert_eq!(pager.scanned_phrase().as_deref(), Some("0 bytes scanned"));
+
+        // Every driver but Athena.
+        let pager = Pager::new(
+            &page(1, 0, false),
+            1,
+            &meta("2026-05-04T10:00:00Z"),
+            datetime!(2026-05-04 10:00:01 UTC),
+            None,
+        );
+        assert_eq!(pager.scanned_phrase(), None);
+        assert!(
+            !pager.line().contains("scanned"),
+            "a driver that does not measure this should not appear to: {}",
+            pager.line()
         );
     }
 

@@ -5,6 +5,12 @@
 //! driver's own test suite reaches the database through the audited path. That is
 //! invariant 1 working — if this file could shortcut it, so could a surface.
 
+// One crate and one cargo feature per driver (§3.0, hedge 2) means a build can ask for
+// any one of them alone — `--no-default-features --features athena` is a real thing to
+// want, and CI now runs it. A test file for a driver that is not in the build has
+// nothing to test.
+#![cfg(feature = "sqlite")]
+
 use std::sync::Arc;
 
 use quokka_core::{

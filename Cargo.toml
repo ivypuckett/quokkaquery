@@ -82,7 +82,38 @@ arrow-array = { version = "56", default-features = false }
 arrow-schema = { version = "56", default-features = false }
 parquet = { version = "56", default-features = false, features = ["arrow", "snap"] }
 
+# Athena (§3.2), behind quokka-driver's `athena` feature. Apache-2.0, pure Rust — with
+# one decision that is not the default and has to be made deliberately.
+#
+# **The TLS provider is the trap.** `aws-config` and every `aws-sdk-*` crate default to
+# `default-https-client`, which resolves to `aws-smithy-http-client/rustls-aws-lc` and
+# pulls `aws-lc-sys`: a C library wanting a C compiler *and* cmake, which §8 says this
+# project does not require. So default features are off everywhere here and the HTTPS
+# client is built by hand from `aws-smithy-http-client` with `rustls-ring` — the same
+# rustls-over-ring stack `sqlx`'s `tls-rustls-ring-native-roots` already puts in the
+# tree, and the same native root store, for the reason the sqlx comment above gives.
+# Checked rather than assumed: `cargo tree` carries no `aws-lc-sys` and no new `-sys`
+# crate at all, and CI guards it (see the `athena` job).
+#
+# `sso` is what M5 is for: `aws-config` resolves `sso_session` profiles from
+# `~/.aws/config` and the token cache `aws sso login` writes, refresh included. It pulls
+# `aws-sdk-sso` and `aws-sdk-ssooidc`, which is *not* the in-process OIDC device flow —
+# that is M7 and would be us driving `ssooidc` ourselves.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "sso"] }
+aws-sdk-athena = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = [
+    "rustls-ring",
+] }
+aws-smithy-runtime-api = { version = "1", default-features = false, features = ["client"] }
+aws-smithy-types = { version = "1", default-features = false }
+aws-credential-types = { version = "1", default-features = false }
+aws-types = { version = "1", default-features = false }
+
 tempfile = "3"
+# The recorded HTTP fixtures §9 asks for, so the Athena driver is tested without Athena.
+# A dev-dependency of `quokka-driver` only: a local listener serving recorded JSON is
+# not a server, and the README says so.
+wiremock = "0.6"
 # Container-backed tests only (§9), behind quokka-driver's `docker-tests` feature.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }

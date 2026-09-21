@@ -162,6 +162,7 @@ pub async fn query(
         let mut sink =
             ExportSink::create(&target.destination, target.format).context("opening the export")?;
         let outcome = execute(engine, request, &mut sink).await?;
+        warn_about_cost(&outcome);
         let report = sink.report(&outcome);
 
         record(engine, &plan, &outcome, &report, &actor, None).await?;
@@ -175,6 +176,7 @@ pub async fn query(
     let path = writer.path().to_path_buf();
 
     let outcome = execute(engine, request, &mut writer).await?;
+    warn_about_cost(&outcome);
 
     // A query that failed has no rows to page or export. The formatter still gets the
     // outcome, so the failure is reported exactly as it was at M1.
@@ -321,6 +323,18 @@ pub async fn export_by_id(
     };
 
     query(engine, spools, plan, actor).await
+}
+
+/// Say the cost warning out loud (§6.4).
+///
+/// stderr in every format, for the reason the truncation note uses it: stdout is one
+/// envelope or a stream of rows, and a sentence in the middle of a pipeline is
+/// corruption of the file. The machine formats also carry it *inside* the envelope as
+/// `cost_warning`, so a script does not have to read stderr to find it.
+fn warn_about_cost(outcome: &Outcome) {
+    if let Some(warning) = &outcome.cost_warning {
+        eprintln!("{warning}");
+    }
 }
 
 /// Print the first rows, page by page, out of the spool.

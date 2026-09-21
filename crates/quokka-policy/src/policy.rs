@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use crate::analyze::{SqlSummary, TableRef};
+use crate::cost::{bytes as bytes_phrase, window as window_phrase, CostContext, CostWarning};
 
 /// Whether a connection may be written to.
 ///
@@ -215,6 +216,15 @@ pub struct Policy<'a> {
     /// The connection's `schema`, used to resolve an unqualified table name against the
     /// allowlist.
     pub default_schema: Option<&'a str>,
+    /// The connection's cost budget, the caller's class, and what that caller has
+    /// already spent inside the window (§6.4).
+    ///
+    /// `None` when the connection configures no `cost_guard`, which is the default and
+    /// the case where nothing is read from the log at all. When it is `Some`, the spend
+    /// inside it was gathered by `quokka-core` and passed here as a value — this crate
+    /// reads nothing, which is the constraint the whole module note in `cost.rs` is
+    /// about.
+    pub cost: Option<CostContext>,
 }
 
 impl<'a> Policy<'a> {
@@ -226,6 +236,7 @@ impl<'a> Policy<'a> {
             write_requested: false,
             allow,
             default_schema: None,
+            cost: None,
         }
     }
 
@@ -292,9 +303,60 @@ impl<'a> Policy<'a> {
             }
         }
 
+        // The budget is checked *last*, once the statement is otherwise acceptable, so
+        // that a stacked body or a write on a read-only connection is reported as what
+        // it is rather than as an overspend. A caller told "you are over budget" would
+        // go and look at the budget, and the budget is not what is wrong.
+        let warning = match self.cost_verdict() {
+            Ok(warning) => warning,
+            Err(denial) => return Outcome::Deny(denial),
+        };
+
         Outcome::Allow {
             writes: !summary.is_certainly_read_only(),
+            warning,
         }
+    }
+
+    /// The cumulative budget of §6.4, layer 2.
+    ///
+    /// Three answers rather than two, and the third is the one worth naming: a spend
+    /// that *could not be read* is not a spend of zero. See
+    /// [`Denial::CostSpendUnknown`].
+    fn cost_verdict(&self) -> Result<Option<CostWarning>, Denial> {
+        let Some(cost) = self.cost else {
+            return Ok(None);
+        };
+        let limit = cost.guard.limit_for(cost.actor);
+
+        let Some(spent) = cost.spend else {
+            // Fail closed, and only where a human asked for a budget: a connection with
+            // no `cost_guard` never gets here, because the caller gathers nothing for it.
+            return Err(Denial::CostSpendUnknown {
+                window: cost.guard.window,
+            });
+        };
+
+        if let Some(limit) = limit {
+            if spent >= limit {
+                return Err(Denial::CostBudgetExhausted {
+                    actor: cost.actor.as_str(),
+                    limit,
+                    spent,
+                    window: cost.guard.window,
+                });
+            }
+        }
+
+        Ok(cost.guard.warn_for(cost.actor).and_then(|threshold| {
+            (spent >= threshold).then_some(CostWarning {
+                spent,
+                threshold,
+                limit,
+                window: cost.guard.window,
+                actor: cost.actor,
+            })
+        }))
     }
 }
 
@@ -305,6 +367,10 @@ pub enum Outcome {
         /// True when the statement was allowed *as a write*, so the engine can record
         /// who authorized it in `approved_by` (§5).
         writes: bool,
+        /// Set when this caller is past a warning threshold but not past a limit
+        /// (§6.4). A sentence for a surface to render, never a behaviour: the query
+        /// runs, and the person is told what has been spent.
+        warning: Option<CostWarning>,
     },
     Deny(Denial),
 }
@@ -348,6 +414,31 @@ pub enum Denial {
     /// An allowlist is configured and the statement could not be parsed, so what it
     /// names is unknown.
     UnknownTables,
+    /// The caller has spent its cumulative budget for this connection (§6.4, layer 2).
+    ///
+    /// The fourth audit shape, not a fifth: a budget refusal is a denial, so it is two
+    /// events sharing a `query_id` whose finish says `denied`, exactly like a
+    /// read-only refusal.
+    CostBudgetExhausted {
+        /// `agent` or `human` — which cap was applied, since they differ (§6.4).
+        actor: &'static str,
+        /// Bytes the cap allows in the window.
+        limit: u64,
+        /// Bytes already scanned inside it.
+        spent: u64,
+        window: Duration,
+    },
+    /// A budget is configured and the spend could not be read out of the audit log.
+    ///
+    /// **This fails closed, and the direction is a decision rather than a `?`.**
+    /// Invariant 6 fails closed when the log cannot be *written*; this is the other
+    /// half. A budget that fell back to "assume nothing has been spent" would be
+    /// removable by whatever made the log unreadable — and the actor this guard exists
+    /// for is precisely the one with shell access. Failing closed costs a person one
+    /// clear error on a connection they gave a budget to; failing open costs them the
+    /// budget without telling them. Connections with no `cost_guard` are unaffected,
+    /// because nothing is read for them at all.
+    CostSpendUnknown { window: Duration },
 }
 
 impl Denial {
@@ -361,6 +452,8 @@ impl Denial {
             Denial::WriteNotOptedIn { .. } => "policy.write_not_opted_in",
             Denial::TableNotAllowed { .. } => "policy.table_not_allowed",
             Denial::UnknownTables => "policy.unknown_tables",
+            Denial::CostBudgetExhausted { .. } => "policy.cost_budget",
+            Denial::CostSpendUnknown { .. } => "policy.cost_unknown",
         }
     }
 
@@ -426,6 +519,40 @@ impl Denial {
                  not reported as a table reference. An allowlisted connection admits \
                  queries, DML and EXPLAIN, whose object lists are complete. An \
                  allowlist that passed what it could not read would not be one."
+            ),
+            Denial::CostBudgetExhausted {
+                actor,
+                limit,
+                spent,
+                window,
+            } => format!(
+                "refusing this query: connection {connection:?} caps {actor}s at {} of \
+                 data scanned per {}, and {} has already been scanned. The budget, the \
+                 window and the caps are `[connections.{connection}.cost_guard]` in the \
+                 config file, which only a human can change (invariant 7).\n\
+                 \n\
+                 Note what this did and did not do. Bytes scanned are reported *after* a \
+                 query runs, so this budget stopped the query after the one that crossed \
+                 the line, not the one that crossed it. The only control that can stop a \
+                 single query mid-flight is the Athena workgroup's \
+                 `BytesScannedCutoffPerQuery`, which is why §6.4 makes a workgroup \
+                 carrying one part of the recommended setup rather than an afterthought.",
+                bytes_phrase(*limit),
+                window_phrase(*window),
+                bytes_phrase(*spent),
+            ),
+            Denial::CostSpendUnknown { window } => format!(
+                "refusing this query: connection {connection:?} has a cost budget and the \
+                 spend over the last {} could not be read out of the audit log, so \
+                 whether the budget is exhausted is unknown.\n\
+                 \n\
+                 This fails closed on purpose. A budget that assumed nothing had been \
+                 spent would be a budget anything able to break the log could remove, and \
+                 the log is the only place the spend is recorded. Fix the audit log — \
+                 `quokka audit verify` is the place to start — or remove \
+                 `[connections.{connection}.cost_guard]` from the config file if you no \
+                 longer want a budget here.",
+                window_phrase(*window),
             ),
         }
     }

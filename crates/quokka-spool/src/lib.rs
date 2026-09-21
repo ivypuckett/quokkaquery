@@ -49,7 +49,7 @@ pub use dir::{default_spool_root, sweep, SpoolSet};
 pub use error::SpoolError;
 pub use export::{export, Destination, ExportFailure, ExportReport, ExportSink, Format};
 pub use meta::{Meta, MetaKey};
-pub use pager::Pager;
+pub use pager::{bytes_scanned, Pager};
 pub use read::{filter_value, Page, Spool, MAX_PAGE_ROWS};
 pub use view::{Direction, Filter, Op, Position, Scoping, SortKey, View};
 pub use write::{Limits, SpoolWriter};
