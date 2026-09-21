@@ -112,6 +112,24 @@ impl Fixture {
         (outcome, sink)
     }
 
+    /// Run several statements in turn, asserting each one.
+    ///
+    /// One call per statement, because a query *is* one statement now: M3 refuses a
+    /// stacked body before it reaches a driver (§6.3), and these fixtures used to lean on
+    /// the hole that let one through. Which is the guardrail working — it caught the test
+    /// suite that set it up.
+    async fn setup(&self, connection: &str, statements: &[&str]) {
+        for sql in statements {
+            let (outcome, _) = self.run(connection, sql).await;
+            assert_eq!(
+                outcome.status,
+                Status::Ok,
+                "setup failed on {sql:?}: {:?}",
+                outcome.error_message
+            );
+        }
+    }
+
     async fn catalog(&self, connection: &str, table: Option<&str>) -> Catalog {
         introspect(
             &self.engine,
@@ -218,15 +236,15 @@ async fn postgres_runs_a_query_end_to_end_and_logs_both_events() {
 async fn postgres_renders_every_exotic_type_as_text_rather_than_failing() {
     let (_c, f) = postgres("QUOKKA_TEST_PG_2").await;
 
-    let (setup, _) = f
-        .run(
-            "db",
-            "CREATE EXTENSION IF NOT EXISTS hstore; \
-             CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy'); \
-             CREATE TYPE point3 AS (x int, y int, z int);",
-        )
-        .await;
-    assert_eq!(setup.status, Status::Ok, "{:?}", setup.error_message);
+    f.setup(
+        "db",
+        &[
+            "CREATE EXTENSION IF NOT EXISTS hstore",
+            "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+            "CREATE TYPE point3 AS (x int, y int, z int)",
+        ],
+    )
+    .await;
 
     let (outcome, sink) = f
         .run(
@@ -351,11 +369,13 @@ async fn postgres_binds_parameters_including_a_null_of_inferred_type() {
 async fn postgres_introspection_leaves_exactly_one_event() {
     let (_c, f) = postgres("QUOKKA_TEST_PG_4").await;
 
-    f.run(
+    f.setup(
         "db",
-        "CREATE TABLE orders (id serial PRIMARY KEY, email text NOT NULL, \
-         total numeric(10,2), tags text[]); \
-         CREATE VIEW big AS SELECT * FROM orders;",
+        &[
+            "CREATE TABLE orders (id serial PRIMARY KEY, email text NOT NULL, \
+             total numeric(10,2), tags text[])",
+            "CREATE VIEW big AS SELECT * FROM orders",
+        ],
     )
     .await;
 
