@@ -13,14 +13,18 @@ name = "quokka"
 path = "src/main.rs"
 
 [features]
-# `quokka-ui` arrives at M4 behind a default-on `ui` feature. Until then the default
-# build is already the headless one, so `--no-default-features` yields a working CLI.
+# The window is default-on, so `cargo install quokkaquery` gets a UI, and separable, so
+# `--no-default-features` yields a headless CLI with no wgpu/winit/iced anywhere in the
+# tree (CLAUDE.md) — which is what you want in a container, in CI, or on an agent's box.
+# CI asserts both halves: that the headless tree carries no GUI dependency, and that the
+# default tree *does* carry iced, so the feature cannot silently switch off.
 #
 # Note what is *not* behind a feature here: the drivers. `--no-default-features` exists
-# to drop the GUI stack for a container or an agent's box, and a headless Postgres
-# client is the most useful thing that build could be. One cargo feature per driver
-# (§3.0, hedge 2) lives on `quokka-driver`, where a slim build asks for it by name.
-default = []
+# to drop the GUI stack, and a headless Postgres client is the most useful thing that
+# build could be. One cargo feature per driver (§3.0, hedge 2) lives on `quokka-driver`,
+# where a slim build asks for it by name.
+default = ["ui"]
+ui = ["dep:quokka-ui"]
 
 [dependencies]
 quokka-audit.workspace = true
@@ -31,6 +35,9 @@ quokka-driver = { workspace = true, features = ["sqlite", "postgres", "mysql"] }
 # --no-default-features` — which exists to drop the GUI stack for a container or an
 # agent's box — still writes Parquet. See quokka-spool's manifest for the rest.
 quokka-spool = { workspace = true, features = ["parquet"] }
+# The window (§7). Optional and default-on: this is the only crate that may depend on
+# `quokka-ui`, and `quokka-ui` depends on nothing but `quokka-core` and `quokka-spool`.
+quokka-ui = { workspace = true, optional = true }
 
 anyhow.workspace = true
 clap.workspace = true

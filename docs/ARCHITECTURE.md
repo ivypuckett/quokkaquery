@@ -686,6 +686,46 @@ result grid bottom-right, audit view as a sibling tab.
   and VMs where GPU access is unreliable.
 - Bundle a font with the binary so rendering is identical across platforms.
 
+### 7.1 What M4 settled, which this section left open
+
+Four questions only turn up once there is a window, and each is recorded here for the
+same reason §6.3's three are: the answer is not recoverable from the code later.
+
+1. **`quokka ui` gets no posture flag.** `quokka mcp --allow-writes` is a *second human
+   key*: the agent did not launch the server, so a human writing the flag into an MCP
+   client's config is a decision the caller cannot make for itself. At a window the
+   person who would type the flag is the person already sitting there, so it is not a
+   second key — it is a speed bump they would learn to always pass, and a third way for
+   a write to fail in the one surface §6.3 says must design that friction out. The UI
+   therefore runs at the connection's own mode, unmodified, which is invariant 9 exactly.
+   Its equivalent of `--write` is the write confirmation, which is per statement rather
+   than per session, and so stricter than a launch flag would have been.
+
+2. **The grid is `iced_table`.** iced 0.14 ships a `table` widget of its own, and it is
+   the better fit for everything except the one thing this section asks for by name:
+   column resize. Its columns take a fixed length and there is no divider to drag, and
+   resize is a real widget — pointer capture, a hover region, a live offset — however
+   small the grid is. `iced_table` is that widget plus the header/body scroll sync it
+   needs, it is MIT, and it does not virtualize, which keeps §1.3's bargain honest: the
+   naive grid is fine at 512 rows and would be catastrophic at a million, so the ceiling
+   cannot quietly become a default.
+
+3. **The audit view is literally a result tab over a saved `@audit` query.** §5 says it
+   is one, and making it one means it is capped at 512 rows, pages from a spool, exports
+   through the audited path, and leaves its own pair of events in the log. A bespoke view
+   would read slightly better and cost a second reader of the log that can disagree with
+   `quokka audit`, plus its own paging, sorting and export. The concession to legibility
+   is that the saved queries are buttons, so nobody has to remember the schema.
+
+4. **Sixteen result tabs, and closing one takes its spool with it.** `quokka mcp` holds
+   thirty-two and releases the oldest because an agent never says it is finished; a
+   window has an explicit close action, which is a better signal. So closing a tab closes
+   its spool and deletes the file immediately, every *open* tab keeps its spool — no
+   eviction behind the user's back, because a tab whose rows vanished is a tab that lies
+   — and what is bounded instead is the number of tabs. Sixteen rather than thirty-two
+   because each one is a thing on screen and each may hold a gigabyte. Opening a
+   seventeenth closes the least recently viewed and says so.
+
 ---
 
 ## 8. Distribution
@@ -703,8 +743,11 @@ Build dependencies to document:
 - **A C compiler on every platform**, because `sqlx-sqlite` builds bundled SQLite through
   `libsqlite3-sys` (§3.1). Present by default on macOS with the Command Line Tools and on
   most Linux images; Windows needs the MSVC build tools.
-- **Linux additionally needs the `winit` stack** (`libxkbcommon`, Wayland or X11
-  development headers) for the UI build.
+- **Linux needs the `winit` stack to *run* the window, not to build it.** `winit` opens
+  `libxkbcommon-x11` and the X11 or Wayland client libraries at runtime rather than
+  linking them, so `cargo build` needs no system package and a missing one is a panic at
+  startup. Packaging has to depend on them; a build image does not. (Established at M4,
+  where the first window to open in CI found out.)
 - **Nothing further for Parquet export.** `parquet`/`arrow` (Apache-2.0) and the `snap`
   codec (BSD-3-Clause) are pure Rust with no `-sys` crate among them, so the C compiler
   above remains the only one. This holds only while the C-linking codecs stay off:
@@ -735,7 +778,12 @@ macOS runners produce ad-hoc-signed binaries automatically.
   reported, never silent.
 - Audit: property test that the hash chain detects every single-row edit or deletion.
 - UI: keep logic in `quokka-core` and out of the iced `update`/`view` functions, so the UI
-  layer is thin enough that its test story is smoke tests and manual passes.
+  layer is thin enough that its test story is smoke tests and manual passes. What that
+  bought at M4: the write confirmation's wording is a table-driven test in `quokka-core`,
+  the pager's line is one in `quokka-spool`, and the UI's own tests call the functions
+  `update` calls without opening a window. The one thing they cannot assert — that the
+  window opens and a typed query runs — is a CI job under Xvfb with the software
+  renderer, which also exercises §7's fallback on every run.
 
 ---
 

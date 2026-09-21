@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use quokka_audit::Client;
 use quokka_core::{
-    execute, explain as core_explain, introspect, record_export, summarize, AccessMode, Actor,
-    Engine, ExecuteRequest, ExplainRequest, ExportRecord, IntrospectRequest, Outcome, Scope,
+    execute_blocking, explain as core_explain, introspect, record_export, summarize, AccessMode,
+    Actor, Engine, ExecuteRequest, ExplainRequest, ExportRecord, IntrospectRequest, Outcome, Scope,
 };
 use quokka_spool::{
     Destination, Format as ExportFormat, Position, Spool, SpoolSet, View, MAX_PAGE_ROWS,
@@ -452,12 +452,10 @@ impl QuokkaMcp {
 
         // The spool writer blocks its caller while a batch lands — harmless in a
         // short-lived CLI and not harmless behind a request handler, where a blocked
-        // worker is every *other* tool call waiting. `block_in_place` is the honest fix:
-        // it tells tokio this thread is about to block so the runtime moves other tasks
-        // off it, and `block_on` drives this query's own I/O here. The alternative,
-        // making `RowSink` async, would push the seam into `execute()` and every surface
-        // for the sake of one caller.
-        let outcome = run_blocking(execute(&self.engine, request, &mut writer))
+        // worker is every *other* tool call waiting. `execute_blocking` is `execute()`
+        // with tokio told about it; the reasoning lives on that function, which the UI
+        // needs for the same reason with a window on the other end of it.
+        let outcome = execute_blocking(&self.engine, request, &mut writer)
             .await
             .map_err(core_error)?;
 
@@ -663,23 +661,6 @@ impl ServerHandler for QuokkaMcp {
                 .to_string(),
         );
         info
-    }
-}
-
-/// Drive a future to completion on a thread the runtime knows is blocked.
-///
-/// See the call site: the spool's writer is synchronous by design, and `execute()` calls
-/// it per row.
-async fn run_blocking<F: std::future::Future>(future: F) -> F::Output {
-    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-            let handle = tokio::runtime::Handle::current();
-            tokio::task::block_in_place(move || handle.block_on(future))
-        }
-        // On a current-thread runtime there is no other worker to move work to, so
-        // `block_in_place` would panic and buy nothing. Awaiting normally is the same
-        // behaviour the CLI has, which is where the blocking was already acceptable.
-        _ => future.await,
     }
 }
 

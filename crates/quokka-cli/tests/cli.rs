@@ -1596,3 +1596,68 @@ async fn the_mcp_subcommand_is_read_only_unless_a_human_says_otherwise() {
     let top = stdout(&w.quokka(&["--help"]));
     assert!(top.contains("mcp"), "{top}");
 }
+
+/// M4: the window is a subcommand of the same binary, with the same global flags and
+/// the same registry behind it.
+///
+/// What is *not* asserted here is that it opens — an integration test that started a
+/// window would need a display, and CI proves that in a job of its own under Xvfb (§9's
+/// "smoke tests and manual passes"). What this checks is the seam: that `quokka ui`
+/// exists, that §7's renderer choice is reachable from the command line, and that
+/// nothing about it is a second way into the engine.
+#[tokio::test]
+async fn the_window_is_a_subcommand_with_the_renderer_choice_on_it() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&["ui", "--help"]);
+    assert_eq!(code(&out), 0, "stderr: {}", stderr(&out));
+    let help = stdout(&out);
+    assert!(
+        help.contains("--renderer"),
+        "§7's software fallback has to be selectable: {help}"
+    );
+    assert!(
+        help.contains("gpu") && help.contains("software"),
+        "both renderers should be named: {help}"
+    );
+
+    // And there is no posture flag here, deliberately — see the note at the top of
+    // `quokka-ui`. `quokka mcp` has one because a human holds the second key for an
+    // agent; at a window the person who would type it is the person already sitting
+    // there, and a mode you can grant yourself is not a guardrail.
+    assert!(
+        !help.contains("--allow-writes"),
+        "the window's authority is the connection's mode, not a flag: {help}"
+    );
+    let mcp = stdout(&w.quokka(&["mcp", "--help"]));
+    assert!(
+        mcp.contains("--allow-writes"),
+        "the MCP server still has one, and for a reason that does not apply here"
+    );
+}
+
+/// A window that never opened has nothing to record.
+///
+/// Asserted by counting `ui` events rather than by comparing the whole log: reading the
+/// log is itself a logged query (§5), so the log is never the same twice — which is the
+/// point of `@audit` rather than an inconvenience.
+#[tokio::test]
+async fn an_unknown_renderer_is_a_usage_error_that_runs_nothing() {
+    let w = Workspace::new().await;
+    let _ = w.quokka(&["query", "--connection", "app", "SELECT 1"]);
+
+    let out = w.quokka(&["ui", "--renderer", "vulkan"]);
+    assert_ne!(code(&out), 0, "an unknown renderer is not a renderer");
+
+    let log: Json = serde_json::from_str(&w.audit_dump()).expect("the log");
+    let from_the_window = log["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter(|row| row["client"] == "ui")
+        .count();
+    assert_eq!(
+        from_the_window, 0,
+        "clap refused the arguments before anything opened, so the window ran nothing"
+    );
+}
