@@ -46,7 +46,7 @@ mod write;
 pub use codec::same_value;
 pub use dir::{default_spool_root, sweep, SpoolSet};
 pub use error::SpoolError;
-pub use export::{export, Destination, ExportReport, ExportSink, Format};
+pub use export::{export, Destination, ExportFailure, ExportReport, ExportSink, Format};
 pub use meta::{Meta, MetaKey};
 pub use read::{filter_value, Page, Spool, MAX_PAGE_ROWS};
 pub use view::{Direction, Filter, Op, Position, Scoping, SortKey, View};

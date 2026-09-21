@@ -154,6 +154,45 @@ impl Destination {
     }
 }
 
+/// An export that stopped part way, and how far it got.
+///
+/// The count is the point. An export that wrote four hundred thousand rows and then met
+/// a full disk has left four hundred thousand rows in a file; logging that as zero would
+/// be the audit trail disagreeing with what is on disk, which is the one thing it may
+/// not do. So the failure carries the progress rather than discarding it, and
+/// `record_export` writes it down.
+#[derive(Debug)]
+pub struct ExportFailure {
+    pub error: SpoolError,
+    /// Rows the writer accepted before it stopped. A partial file may hold them.
+    pub rows: u64,
+    /// Bytes it managed to put on disk.
+    pub bytes: u64,
+}
+
+impl std::fmt::Display for ExportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
+impl std::error::Error for ExportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl ExportFailure {
+    /// A failure before any row was written.
+    fn at_start(error: SpoolError) -> Self {
+        ExportFailure {
+            error,
+            rows: 0,
+            bytes: 0,
+        }
+    }
+}
+
 /// Export a view of a spool.
 ///
 /// Reads the spool and nothing else: no database is touched, whatever the file's size
@@ -163,28 +202,71 @@ pub async fn export(
     destination: &Destination,
     format: Format,
     view: &View,
-) -> Result<ExportReport, SpoolError> {
+) -> Result<ExportReport, ExportFailure> {
     let started = std::time::Instant::now();
 
     #[cfg(feature = "parquet")]
     if format == Format::Parquet {
-        let report = crate::parquet::export(spool, destination, view).await?;
-        return Ok(report);
+        let mut rows = 0u64;
+        return crate::parquet::export(spool, destination, view, &mut rows)
+            .await
+            .map_err(|error| ExportFailure {
+                error,
+                rows,
+                bytes: bytes_on_disk(destination),
+            });
     }
 
-    let mut writer = TextWriter::new(format, destination.open()?);
-    writer.begin(spool.columns())?;
-    let rows = spool.stream(view, |row| writer.row(row)).await?;
-    let bytes = writer.finish()?;
+    let mut writer = TextWriter::new(format, destination.open().map_err(ExportFailure::at_start)?);
+    writer
+        .begin(spool.columns())
+        .map_err(ExportFailure::at_start)?;
 
-    Ok(ExportReport {
-        path: destination.display(),
-        format,
-        rows,
-        bytes,
-        duration_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
-        scope: spool.scoping(),
-    })
+    let mut rows = 0u64;
+    let streamed = spool
+        .stream(view, |row| {
+            writer.row(row)?;
+            rows += 1;
+            Ok(())
+        })
+        .await;
+
+    match streamed {
+        // The rows are all through the writer, but a buffered writer does most of its
+        // work at the flush — which is exactly where a full disk says so.
+        Ok(_) => match writer.finish() {
+            Ok(bytes) => Ok(ExportReport {
+                path: destination.display(),
+                format,
+                rows,
+                bytes,
+                duration_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                scope: spool.scoping(),
+            }),
+            Err(error) => Err(ExportFailure {
+                error,
+                rows,
+                bytes: writer.bytes_written(),
+            }),
+        },
+        Err(error) => {
+            // Flush what there is, so the count above describes a file that exists.
+            let _ = writer.finish();
+            Err(ExportFailure {
+                error,
+                rows,
+                bytes: writer.bytes_written(),
+            })
+        }
+    }
+}
+
+/// What actually reached the file, for a writer that does not count its own bytes.
+fn bytes_on_disk(destination: &Destination) -> u64 {
+    match destination {
+        Destination::Path(path) => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        Destination::Stdout => 0,
+    }
 }
 
 /// A sink that writes rows straight to a file as the driver yields them.
@@ -366,6 +448,12 @@ impl TextWriter {
         let mut out = self.out.take().expect("checked above");
         out.flush().map_err(|e| SpoolError::Export(e.to_string()))?;
         Ok(self.bytes)
+    }
+
+    /// What has reached the writer so far — which after a failed flush is the honest
+    /// upper bound on what reached the file.
+    fn bytes_written(&self) -> u64 {
+        self.bytes
     }
 
     fn separator(&self) -> char {

@@ -48,6 +48,13 @@ pub mod exit {
     /// The audit log could not be written. Either the query was refused before it ran
     /// (invariant 6) or it ran and its outcome went unrecorded.
     pub const AUDIT_FAILED: u8 = 4;
+    /// The query ran and was logged; writing its export did not work.
+    ///
+    /// Its own code because neither of the neighbouring ones is true: a full disk is
+    /// not the caller's usage error, and the query really did run. A script that sees
+    /// this should retry the file, not re-examine its arguments — and the rows are in
+    /// the log either way.
+    pub const EXPORT_FAILED: u8 = 5;
 }
 
 #[derive(Debug, Parser)]
@@ -735,6 +742,11 @@ fn os_user() -> String {
 }
 
 fn classify(e: &anyhow::Error) -> u8 {
+    // Checked before the core errors, because an export failure is the more specific
+    // claim: the query it names ran, and only the file did not.
+    if e.downcast_ref::<spool::ExportFailed>().is_some() {
+        return exit::EXPORT_FAILED;
+    }
     match e.downcast_ref::<quokka_core::CoreError>() {
         Some(quokka_core::CoreError::AuditWriteFailed { .. })
         | Some(quokka_core::CoreError::AuditFinishFailed { .. })

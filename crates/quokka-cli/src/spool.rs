@@ -32,6 +32,28 @@ use uuid::Uuid;
 use crate::exit;
 use crate::format::{sink_for, Format};
 
+/// The query ran and was logged; writing its export did not work.
+///
+/// A type of its own purely so [`crate::exit::EXPORT_FAILED`] can be told apart from a
+/// usage error. Written by hand rather than with `thiserror`, which is a library
+/// dependency this crate does not otherwise carry.
+#[derive(Debug)]
+pub struct ExportFailed(pub quokka_spool::SpoolError);
+
+impl std::fmt::Display for ExportFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No interpolation of the source: it is the next line of the chain already, and
+        // printing it twice reads like two failures.
+        f.write_str("the export could not be written")
+    }
+}
+
+impl std::error::Error for ExportFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Everything `quokka query` was asked for.
 pub struct QueryPlan {
     pub connection: String,
@@ -370,7 +392,7 @@ async fn finish_export(
     engine: &Engine,
     plan: &QueryPlan,
     outcome: &Outcome,
-    report: Result<ExportReport, quokka_spool::SpoolError>,
+    report: Result<ExportReport, quokka_spool::ExportFailure>,
     actor: &Actor,
     status_so_far: u8,
 ) -> Result<u8> {
@@ -385,15 +407,16 @@ async fn finish_export(
             summarize_export(plan.format, outcome, &report, false)?;
             Ok(status_so_far)
         }
-        Err(e) => {
+        Err(failure) => {
             // A failed export can still have left a partial file behind, so it is
-            // logged as what it was: an export that happened and went wrong. Saying
-            // nothing would leave a file on disk that the log never mentions.
-            let failed = ExportReport {
+            // logged as what it was: an export that happened, went wrong, and put this
+            // many rows on disk before it did. Logging zero would have the audit trail
+            // disagreeing with the file.
+            let partial = ExportReport {
                 path: target.destination.display(),
                 format: target.format,
-                rows: 0,
-                bytes: 0,
+                rows: failure.rows,
+                bytes: failure.bytes,
                 duration_ms: 0,
                 scope: Scoping {
                     spooled_rows: outcome.rows_spooled.unwrap_or(0),
@@ -402,8 +425,8 @@ async fn finish_export(
                     truncated_by_max_rows: outcome.truncated,
                 },
             };
-            record(engine, plan, outcome, &failed, actor, Some(&e)).await?;
-            Err(anyhow::Error::new(e).context("writing the export"))
+            record(engine, plan, outcome, &partial, actor, Some(&failure.error)).await?;
+            Err(anyhow::Error::new(ExportFailed(failure.error)))
         }
     }
 }

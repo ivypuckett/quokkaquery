@@ -1147,3 +1147,106 @@ async fn exporting_to_stdout_leaves_stdout_holding_only_the_export() {
     // The summary still happened — on the other stream.
     assert!(stderr(&out).contains("exported 2 rows"), "{}", stderr(&out));
 }
+
+/// An export that fails is not a usage error and not a failed query: the query ran and
+/// is logged, and only the file did not appear. It gets its own exit code, and the log
+/// records how far it got.
+#[tokio::test]
+async fn a_failed_export_has_its_own_exit_code_and_is_logged() {
+    let w = Workspace::new().await;
+
+    // A destination that cannot be created, because it is already a directory.
+    let blocked = w.dir.path().join("out.csv");
+    std::fs::create_dir(&blocked).expect("directory");
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--export",
+        blocked.to_str().expect("path"),
+    ]);
+    assert_eq!(
+        code(&out),
+        5,
+        "a full disk is not the caller's usage error; stderr: {}",
+        stderr(&out)
+    );
+
+    // The query itself still ran and was logged, and so was the export that failed —
+    // silence would leave a file nobody could account for.
+    let events = audit_rows(
+        &w,
+        "SELECT event_kind, status, error_code, rows_returned FROM audit_log \
+         WHERE event_kind IN ('query_finished', 'export') ORDER BY id",
+    );
+    assert_eq!(events[0]["event_kind"], "query_finished");
+    assert_eq!(events[0]["status"], "ok");
+    assert_eq!(events[1]["event_kind"], "export");
+    assert_eq!(events[1]["status"], "error");
+    assert_eq!(events[1]["error_code"], "spool.io");
+    // Nothing was opened, so nothing was written.
+    assert_eq!(events[1]["rows_returned"], 0);
+}
+
+/// The other failure, and the one that matters more: a disk that fills up *part way*.
+/// The file holds the rows written before it stopped, so the log says so rather than
+/// claiming zero — an audit trail that disagreed with what is on disk would be worse
+/// than no record at all.
+///
+/// Linux only: `/dev/full` is the cheapest honest `ENOSPC`, and the other platforms have
+/// no equivalent that does not involve building a filesystem.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_part_written_export_logs_the_rows_that_reached_the_file() {
+    if !std::path::Path::new("/dev/full").exists() {
+        eprintln!("skipped: this system has no /dev/full");
+        return;
+    }
+
+    let w = Workspace::new().await;
+
+    // Enough rows that the writer's buffer flushes mid-stream rather than only at the
+    // end, which is what puts the failure part way through.
+    let seed = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+         INSERT INTO orders (id, email, total) SELECT i + 1000, 'x@y.example', i FROM n",
+    ]);
+    assert_eq!(code(&seed), 0, "stderr: {}", stderr(&seed));
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT * FROM orders",
+        "--max-rows",
+        "5000",
+        "--export",
+        "/dev/full",
+        "--export-format",
+        "csv",
+    ]);
+    assert_eq!(code(&out), 5, "stderr: {}", stderr(&out));
+
+    let exports = audit_rows(
+        &w,
+        "SELECT status, error_code, rows_returned FROM audit_log \
+         WHERE event_kind = 'export' ORDER BY id",
+    );
+    assert_eq!(exports.len(), 1);
+    assert_eq!(exports[0]["status"], "error");
+
+    let written = exports[0]["rows_returned"].as_i64().expect("a row count");
+    assert!(
+        written > 0,
+        "a part-written export was logged as having written nothing"
+    );
+    assert!(
+        written < 2002,
+        "the export cannot have written more rows than the result holds"
+    );
+}

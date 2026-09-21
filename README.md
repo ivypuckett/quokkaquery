@@ -90,7 +90,10 @@ needed to run it again was never written down — and reconstructing SQL from a 
 would run a different query from the one you are citing, so we refuse rather than guess.
 
 **Exports are audited events in their own right**, linked to the query that produced them
-by `parent_id`. Note that this is the opposite of the rule for a catalog cache hit, and
+by `parent_id` — including the ones that fail. An export that filled a disk part way
+through is logged with the rows that reached the file, because a log that disagreed with
+what is on disk would be worse than no record at all, and it exits `5` rather than the
+usage code: the query ran, only the file did not. Note that this is the opposite of the rule for a catalog cache hit, and
 deliberately: a cache hit logs nothing because nothing was read, while an export logs
 because "someone wrote ten million rows to a file" is exactly what an audit trail exists
 to catch.

@@ -82,6 +82,9 @@ pub(crate) async fn export(
     spool: &Spool,
     destination: &Destination,
     view: &View,
+    // Owned by the caller, so a failure part way through still knows how many rows the
+    // writer had taken — see `ExportFailure`.
+    rows: &mut u64,
 ) -> Result<ExportReport, SpoolError> {
     let started = std::time::Instant::now();
 
@@ -141,7 +144,6 @@ pub(crate) async fn export(
 
     // Pass two: write.
     let mut batch: Vec<Vec<Value>> = Vec::with_capacity(BATCH_ROWS);
-    let mut rows = 0u64;
     let mut pending: Option<SpoolError> = None;
 
     let flush = |batch: &mut Vec<Vec<Value>>,
@@ -163,7 +165,7 @@ pub(crate) async fn export(
     let stream = spool
         .stream(view, |row| {
             batch.push(row.0.clone());
-            rows += 1;
+            *rows += 1;
             if batch.len() >= BATCH_ROWS {
                 if let Err(e) = flush(&mut batch, &mut writer) {
                     pending = Some(e);
@@ -189,7 +191,7 @@ pub(crate) async fn export(
     Ok(ExportReport {
         path: path.display().to_string(),
         format: Format::Parquet,
-        rows,
+        rows: *rows,
         bytes,
         duration_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
         scope: spool.scoping(),
