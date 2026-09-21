@@ -608,6 +608,10 @@ impl QuokkaMcp {
             scope_note: scope.note(),
             whole_result: scope.is_whole_result(),
             duration_ms: outcome.duration_ms,
+            data_scanned_bytes: outcome.data_scanned_bytes,
+            data_scanned: outcome.data_scanned_bytes.map(quokka_spool::bytes_scanned),
+            engine_time_ms: outcome.engine_time_ms,
+            cost_warning: outcome.cost_warning.clone(),
             error_code: outcome.error_code.clone(),
             error_message: outcome.error_message.clone(),
         }))
@@ -657,7 +661,13 @@ impl ServerHandler for QuokkaMcp {
                  it is there when the rows you have are a prefix of the result rather \
                  than all of it.\n\n\
                  Queries cost money and touch production, so nothing here runs \
-                 implicitly and nothing refreshes itself."
+                 implicitly and nothing refreshes itself. On a connection that bills by \
+                 data scanned, every response carries `data_scanned_bytes` — what that \
+                 query cost, reported after the fact because that is when the engine \
+                 knows. A connection may also have a cumulative budget: spend it and \
+                 queries are refused with `policy.cost_budget` until the window rolls \
+                 over. That is a refusal to stop at, not to retry: only a human editing \
+                 the config file changes a budget."
                 .to_string(),
         );
         info
@@ -1013,6 +1023,21 @@ pub struct QueryResponse {
     pub scope_note: Option<String>,
     pub whole_result: bool,
     pub duration_ms: i64,
+    /// Bytes the engine reported scanning (§3.2). Absent when the driver does not
+    /// measure it, which is everything but Athena — absent rather than zero, because
+    /// zero is a real Athena answer and means the result came from the cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_scanned_bytes: Option<i64>,
+    /// The same number in words, so an agent reporting back to a person does not have to
+    /// divide by 10^9 and get it wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_scanned: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_time_ms: Option<i64>,
+    /// Present when this actor is past a cost warning threshold but not past its limit
+    /// (§6.4). The same sentence the CLI prints and the window shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_warning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1038,6 +1063,12 @@ impl QueryResponse {
             scope_note: None,
             whole_result: false,
             duration_ms: outcome.duration_ms,
+            // A query that failed may still have scanned — and been charged for — a
+            // great deal. An agent that cannot see that cannot report it.
+            data_scanned_bytes: outcome.data_scanned_bytes,
+            data_scanned: outcome.data_scanned_bytes.map(quokka_spool::bytes_scanned),
+            engine_time_ms: outcome.engine_time_ms,
+            cost_warning: outcome.cost_warning.clone(),
             error_code: outcome.error_code.clone(),
             error_message: outcome.error_message.clone(),
         }

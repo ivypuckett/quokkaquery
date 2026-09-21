@@ -1661,3 +1661,366 @@ async fn an_unknown_renderer_is_a_usage_error_that_runs_nothing() {
         "clap refused the arguments before anything opened, so the window ran nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M5: the cost guard (§6.4), and the same refusal from every surface
+// ---------------------------------------------------------------------------
+
+/// Put a finished query in the log that scanned `bytes`, as an Athena query would have.
+///
+/// The budget sums `data_scanned_bytes` over `query_finished` rows, so this is what
+/// having spent something looks like. Writing it directly rather than running a query is
+/// the only way to test the accounting without an Athena to scan anything — and it is
+/// the same append the engine makes, through the same API, so the chain stays intact.
+async fn spend(
+    audit_db: &Path,
+    connection: &str,
+    actor_id: &str,
+    kind: quokka_audit::ActorKind,
+    bytes: i64,
+) {
+    let audit = quokka_audit::AuditLog::open(audit_db)
+        .await
+        .expect("audit log");
+    let event = quokka_audit::AuditEvent {
+        id: uuid::Uuid::now_v7(),
+        query_id: uuid::Uuid::now_v7(),
+        parent_id: None,
+        at: quokka_audit::now_rfc3339().expect("a timestamp"),
+        duration_ms: Some(10),
+        actor_kind: kind,
+        actor_id: actor_id.to_string(),
+        session_id: "seed".to_string(),
+        client: quokka_audit::Client::Cli,
+        connection: connection.to_string(),
+        dialect: "athena".to_string(),
+        database: None,
+        schema_name: None,
+        event_kind: quokka_audit::EventKind::QueryFinished,
+        sql_logging: quokka_audit::SqlLogging::Fingerprint,
+        sql_text: None,
+        sql_fingerprint: "SELECT ?".to_string(),
+        statement_kind: Some("query".to_string()),
+        read_only: Some(true),
+        params: None,
+        status: quokka_audit::Status::Ok,
+        error_code: None,
+        error_message: None,
+        rows_returned: Some(1),
+        rows_affected: None,
+        rows_spooled: None,
+        truncated: Some(false),
+        export_format: None,
+        export_path: None,
+        data_scanned_bytes: Some(bytes),
+        cost_estimate_usd: None,
+        approved_by: None,
+        tags: None,
+    };
+    audit.append(event).await.expect("append");
+    audit.close().await;
+}
+
+/// A workspace whose `app` connection carries a budget an agent has already spent.
+async fn budgeted() -> Workspace {
+    let w = Workspace::new().await;
+    let base = std::fs::read_to_string(w.dir.path().join("config.toml")).expect("config");
+    std::fs::write(
+        w.dir.path().join("config.toml"),
+        format!(
+            "{base}\n\
+             [connections.app.cost_guard]\n\
+             window      = \"1d\"\n\
+             agent_limit = \"50GB\"\n\
+             human_limit = \"unlimited\"\n\
+             human_warn  = \"500GB\"\n"
+        ),
+    )
+    .expect("config with a budget");
+
+    // The log has to exist before anything can be appended to it, and `audit verify` on
+    // a fresh workspace creates it without running a query.
+    w.quokka(&["audit", "verify"]);
+    spend(
+        &w.audit_db(),
+        "app",
+        "claude",
+        quokka_audit::ActorKind::Agent,
+        60_000_000_000,
+    )
+    .await;
+    w
+}
+
+/// **A budget refusal is a denial**: exit code 6, the code in the JSON envelope, and two
+/// events in the log with `denied` on the second.
+#[tokio::test]
+async fn an_agent_past_its_budget_is_refused_and_the_refusal_is_logged() {
+    let w = budgeted().await;
+
+    let out = w.quokka(&[
+        "--actor",
+        "claude",
+        "query",
+        "--connection",
+        "app",
+        "SELECT 1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        code(&out),
+        6,
+        "a budget refusal is a denial, not a failed query: {}",
+        stderr(&out)
+    );
+
+    let envelope: Json = serde_json::from_str(stderr(&out).trim()).expect("a JSON error");
+    assert_eq!(envelope["denied"], Json::Bool(true));
+    assert_eq!(envelope["code"], "policy.cost_budget");
+
+    let message = envelope["error"].as_str().expect("a message");
+    assert!(message.contains("50 GB"), "the budget: {message}");
+    assert!(message.contains("1d"), "the window: {message}");
+    assert!(message.contains("60 GB"), "the spend: {message}");
+    assert!(
+        message.contains("after the one that crossed the line"),
+        "the message must not promise a pre-execution cap: {message}"
+    );
+
+    // In the log as the fourth shape, and the chain still verifies.
+    let out = w.quokka(&[
+        "audit",
+        "query",
+        "SELECT count(*) AS n FROM audit_log WHERE status = 'denied' \
+         AND error_code = 'policy.cost_budget'",
+        "--format",
+        "json",
+    ]);
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(envelope["rows"][0]["n"], 1);
+
+    assert_eq!(code(&w.quokka(&["audit", "verify"])), 0);
+}
+
+/// The asymmetry, at the binary: the same connection, the same budget, a human instead
+/// of an agent.
+#[tokio::test]
+async fn a_human_is_not_refused_by_the_agent_cap() {
+    let w = budgeted().await;
+    // The human's own spend, which is well under `human_warn` and uncapped anyway.
+    spend(
+        &w.audit_db(),
+        "app",
+        "ivy",
+        quokka_audit::ActorKind::Human,
+        60_000_000_000,
+    )
+    .await;
+
+    let out = w.quokka(&[
+        "--actor",
+        "ivy",
+        "--actor-kind",
+        "human",
+        "query",
+        "--connection",
+        "app",
+        "SELECT 1 AS n",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        code(&out),
+        0,
+        "a human on an uncapped connection runs: {}",
+        stderr(&out)
+    );
+}
+
+/// A human past `human_warn` runs, and is told — in the envelope and on stderr.
+#[tokio::test]
+async fn a_human_past_the_warning_threshold_is_told_without_being_stopped() {
+    let w = budgeted().await;
+    spend(
+        &w.audit_db(),
+        "app",
+        "ivy",
+        quokka_audit::ActorKind::Human,
+        600_000_000_000,
+    )
+    .await;
+
+    let out = w.quokka(&[
+        "--actor",
+        "ivy",
+        "--actor-kind",
+        "human",
+        "query",
+        "--connection",
+        "app",
+        "SELECT 1 AS n",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        code(&out),
+        0,
+        "a warning is not a refusal: {}",
+        stderr(&out)
+    );
+
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    let warning = envelope["cost_warning"]
+        .as_str()
+        .expect("the envelope carries the warning");
+    assert!(warning.contains("600 GB"), "{warning}");
+    assert!(
+        stderr(&out).contains("600 GB"),
+        "and a person reading a terminal sees it too: {}",
+        stderr(&out)
+    );
+}
+
+/// The budget check reads the log before every query on a budgeted connection, and
+/// leaves nothing behind when it does. A log that fills with its own bookkeeping is a
+/// log nobody reads.
+#[tokio::test]
+async fn the_budget_check_adds_no_events_of_its_own() {
+    let w = Workspace::new().await;
+    let base = std::fs::read_to_string(w.dir.path().join("config.toml")).expect("config");
+    std::fs::write(
+        w.dir.path().join("config.toml"),
+        format!("{base}\n[connections.app.cost_guard]\nwindow = \"1d\"\nagent_limit = \"50GB\"\n"),
+    )
+    .expect("config");
+
+    for _ in 0..3 {
+        let out = w.quokka(&[
+            "--actor",
+            "claude",
+            "query",
+            "--connection",
+            "app",
+            "SELECT 1 AS n",
+            "--format",
+            "json",
+        ]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+    }
+
+    let out = w.quokka(&[
+        "audit",
+        "query",
+        "SELECT count(*) AS n FROM audit_log WHERE connection = 'app'",
+        "--format",
+        "json",
+    ]);
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(
+        envelope["rows"][0]["n"], 6,
+        "three queries, two events each, and nothing the budget check wrote"
+    );
+}
+
+/// **The parity test grows again.** A budget denial reads identically from the CLI and
+/// from MCP, the way a read-only refusal already does. The window's half of this is in
+/// `quokka-ui/tests/window.rs`, which asserts the same code and the same three facts —
+/// there is one place these words are composed, and it is `quokka-policy`.
+#[tokio::test]
+async fn a_budget_denial_reads_the_same_from_the_cli_and_from_mcp() {
+    use std::sync::Arc;
+
+    let w = budgeted().await;
+
+    let out = w.quokka(&[
+        "--actor",
+        "claude",
+        "query",
+        "--connection",
+        "app",
+        "SELECT 1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 6);
+    let from_cli: Json = serde_json::from_str(stderr(&out).trim()).expect("JSON");
+
+    // The same config and the same log, through the MCP server.
+    let audit = quokka_core::AuditLog::open(w.audit_db())
+        .await
+        .expect("audit log");
+    let config = quokka_core::Config::load(Some(&w.dir.path().join("config.toml")), &w.audit_db())
+        .expect("config");
+    let engine = Arc::new(quokka_core::Engine::new(
+        config.registry,
+        audit,
+        quokka_driver::builtin_factories(),
+    ));
+    let spools = Arc::new(
+        quokka_spool::SpoolSet::open(
+            Some(&w.dir.path().join("cache-mcp")),
+            quokka_spool::Limits::from(config.spool),
+        )
+        .await
+        .expect("spools"),
+    );
+    let server = quokka_mcp::QuokkaMcp::new(
+        engine,
+        spools,
+        quokka_core::Actor {
+            kind: quokka_core::ActorKind::Agent,
+            id: "claude".to_string(),
+        },
+        quokka_core::AccessMode::ReadWrite,
+    );
+
+    let answer = server
+        .query(rmcp::handler::server::wrapper::Parameters(
+            serde_json::from_value(serde_json::json!({
+                "connection": "app",
+                "sql": "SELECT 1",
+            }))
+            .expect("arguments"),
+        ))
+        .await;
+    let err = answer
+        .err()
+        .expect("the same budget refuses the same query");
+    let from_mcp = err.data.expect("a denial carries its code");
+
+    assert_eq!(from_cli["code"], from_mcp["code"]);
+    assert_eq!(from_mcp["code"], "policy.cost_budget");
+    assert_eq!(
+        from_cli["error"].as_str(),
+        Some(err.message.as_ref()),
+        "the same budget refused the same query in different words depending on who asked"
+    );
+}
+
+/// A driver that measures nothing says nothing. The envelope carries
+/// `data_scanned_bytes` only when there is a number, so a script summing the field
+/// across connections is never handed a 0 that means "not measured".
+#[tokio::test]
+async fn a_driver_that_scans_nothing_reports_no_cost_field() {
+    let w = Workspace::new().await;
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT 1 AS n",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert!(
+        envelope.get("data_scanned_bytes").is_none(),
+        "SQLite measures nothing, so the field should be absent rather than 0: {envelope}"
+    );
+    assert!(envelope.get("cost_warning").is_none());
+    // And the table format's footer says nothing about scanning either.
+    let out = w.quokka(&["query", "--connection", "app", "SELECT 1 AS n"]);
+    assert!(!stdout(&out).contains("scanned"), "{}", stdout(&out));
+}

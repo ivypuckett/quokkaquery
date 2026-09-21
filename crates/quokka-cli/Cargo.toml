@@ -30,7 +30,15 @@ ui = ["dep:quokka-ui"]
 quokka-audit.workspace = true
 quokka-core.workspace = true
 quokka-mcp.workspace = true
-quokka-driver = { workspace = true, features = ["sqlite", "postgres", "mysql"] }
+# Every driver, not behind a CLI feature — see the note above. Athena joins them at M5,
+# which is what "full connector set" means: a binary that cannot reach Athena would not
+# be one.
+quokka-driver = { workspace = true, features = [
+    "sqlite",
+    "postgres",
+    "mysql",
+    "athena",
+] }
 # Parquet asked for by name rather than inherited, so `cargo install quokkaquery
 # --no-default-features` — which exists to drop the GUI stack for a container or an
 # agent's box — still writes Parquet. See quokka-spool's manifest for the rest.
@@ -49,6 +57,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 uuid.workspace = true
 
 [dev-dependencies]
+# A dev-dependency too, so a test can append an event by hand — which is how the cost
+# budget's tests put a spend in the log without an Athena to scan anything.
+quokka-audit.workspace = true
+quokka-core.workspace = true
 quokka-driver = { workspace = true, features = ["sqlite"] }
 quokka-spool = { workspace = true }
 rmcp = { workspace = true, default-features = false, features = ["server", "macros"] }
