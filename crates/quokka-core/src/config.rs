@@ -39,6 +39,18 @@ pub const DEFAULT_SPOOL_MAX_ROWS: u64 = 1_000_000;
 /// (§4.2).
 pub const DEFAULT_SPOOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// How old a spool may get before a result tab flags itself stale (§4.1).
+///
+/// Ephemerality bounds staleness to one process lifetime; it does not eliminate it. A
+/// result spooled at 10:00 and read at 10:45 is forty-five minutes old, and a query
+/// tool that shows you stale data without saying so has failed at its one job. So a
+/// result tab always shows how old its rows are, and past this it says so loudly.
+///
+/// Thirty minutes because that is roughly when "I ran this a moment ago" stops being
+/// true. Nothing re-runs when it expires — §1.4 forbids that — the tab only becomes
+/// honest about its age.
+pub const DEFAULT_SPOOL_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
+
 /// How long a connection attempt may keep trying before it is called a failure.
 ///
 /// sqlx's pool retries a refused or unreachable server until its acquire timeout, which
@@ -214,6 +226,14 @@ pub fn default_port(driver: &str) -> Option<u16> {
 pub struct SpoolConfig {
     pub max_rows: u64,
     pub max_bytes: u64,
+    /// How old a spool may get before a surface calls it stale (§4.1). `None` when the
+    /// config file asked for no staleness flag at all.
+    ///
+    /// §4.1 names this setting `spool_stale_after`; under `[spool]` it is spelled
+    /// `stale_after`, which is the same name with the table's prefix factored out.
+    /// Human-only like everything else here: a surface that could extend its own
+    /// freshness window would be a surface that decides when its rows stop being old.
+    pub stale_after: Option<Duration>,
 }
 
 impl Default for SpoolConfig {
@@ -221,6 +241,7 @@ impl Default for SpoolConfig {
         Self {
             max_rows: DEFAULT_SPOOL_MAX_ROWS,
             max_bytes: DEFAULT_SPOOL_MAX_BYTES,
+            stale_after: Some(DEFAULT_SPOOL_STALE_AFTER),
         }
     }
 }
@@ -234,6 +255,9 @@ struct SpoolFile {
     /// `"1GiB"`, `"512MB"`, or a plain byte count.
     #[serde(default)]
     max_bytes: Option<String>,
+    /// `"30m"`, `"2h"`, or `"0"` to never flag a result as stale (§4.1).
+    #[serde(default)]
+    stale_after: Option<String>,
 }
 
 /// A connection as the TOML file spells it.
@@ -357,6 +381,18 @@ fn spool_config(path: &Path, file: &SpoolFile) -> Result<SpoolConfig, CoreError>
                  \"512MB\" or a plain number of bytes"
             ),
         })?;
+    }
+    if let Some(text) = &file.stale_after {
+        let duration = parse_duration(text).ok_or_else(|| CoreError::Config {
+            path: path.to_path_buf(),
+            detail: format!(
+                "[spool] stale_after {text:?} is not a duration; write it as \"30m\", \
+                 \"2h\", or \"0\" to never flag a result as stale"
+            ),
+        })?;
+        // Zero turns the flag off rather than making everything instantly stale, which
+        // is the only reading under which the setting is useful at zero.
+        spool.stale_after = (!duration.is_zero()).then_some(duration);
     }
     Ok(spool)
 }
@@ -739,6 +775,30 @@ mod tests {
         let err = Registry::load(Some(&config), &audit_db)
             .expect_err("a config file must not be able to redirect @audit");
         assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn stale_after_is_a_duration_and_zero_means_never() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit_db = dir.path().join("audit.db");
+
+        let default = Config::load(None, &audit_db).expect("load").spool;
+        assert_eq!(default.stale_after, Some(DEFAULT_SPOOL_STALE_AFTER));
+
+        let config = write(dir.path(), "[spool]\nstale_after = \"5m\"\n");
+        let spool = Config::load(Some(&config), &audit_db).expect("load").spool;
+        assert_eq!(spool.stale_after, Some(Duration::from_secs(300)));
+
+        let config = write(dir.path(), "[spool]\nstale_after = \"0\"\n");
+        let spool = Config::load(Some(&config), &audit_db).expect("load").spool;
+        assert_eq!(
+            spool.stale_after, None,
+            "zero turns the flag off; it does not make every result instantly stale"
+        );
+
+        let config = write(dir.path(), "[spool]\nstale_after = \"soon\"\n");
+        let err = Config::load(Some(&config), &audit_db).expect_err("not a duration");
+        assert!(err.to_string().contains("stale_after"), "{err}");
     }
 
     #[test]

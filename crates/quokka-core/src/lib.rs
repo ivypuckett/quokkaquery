@@ -9,6 +9,7 @@
 
 pub mod catalog;
 pub mod config;
+pub mod confirm;
 pub mod credential;
 pub mod driver;
 pub mod engine;
@@ -24,16 +25,18 @@ pub use config::{
     default_config_path, default_port, dialect_hint, AccessMode, Allowlist, Config,
     ConnectionConfig, Limits, Registry, SpoolConfig, TlsMode, AUDIT_CONNECTION,
     DEFAULT_CATALOG_TTL, DEFAULT_CONNECT_TIMEOUT, DEFAULT_SPOOL_MAX_BYTES, DEFAULT_SPOOL_MAX_ROWS,
+    DEFAULT_SPOOL_STALE_AFTER,
 };
+pub use confirm::WriteConfirmation;
 pub use credential::{Backend as CredentialBackend, CredentialError, CredentialRef};
 pub use driver::{
     Catalog, Driver, DriverFactory, ExecutePermit, MetaHandle, Plan, QueryHandle, QueryRequest,
     QueryStream, ResultMeta, Scope, TableInfo,
 };
 pub use engine::{
-    events_for_query, execute, explain, introspect, Actor, Cap, CatalogResult, Engine,
-    ExecuteRequest, ExplainOutcome, ExplainRequest, IntrospectRequest, NullSink, Outcome, Retained,
-    RowSink, DEFAULT_MAX_ROWS,
+    events_for_query, execute, execute_blocking, explain, introspect, Actor, Cap, CatalogResult,
+    Engine, ExecuteRequest, ExplainOutcome, ExplainRequest, IntrospectRequest, NullSink, Outcome,
+    Retained, RowSink, DEFAULT_MAX_ROWS,
 };
 pub use error::{CoreError, DriverError};
 pub use export::{record_export, ExportRecord};
