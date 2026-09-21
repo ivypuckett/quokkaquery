@@ -19,6 +19,16 @@ pub fn spool_writer(limits: Limits) -> (tempfile::TempDir, SpoolWriter, PathBuf)
 
 /// Close a spool the way `execute()` would, with the outcome it would have built.
 pub fn finish(writer: &mut SpoolWriter, rows_returned: u64, truncated: bool) {
+    finish_scanning(writer, rows_returned, truncated, None)
+}
+
+/// The same, for a driver that reported what it scanned (§3.2).
+pub fn finish_scanning(
+    writer: &mut SpoolWriter,
+    rows_returned: u64,
+    truncated: bool,
+    data_scanned_bytes: Option<i64>,
+) {
     let retained = writer.retained();
     let outcome = Outcome {
         query_id: Uuid::now_v7(),
@@ -31,6 +41,10 @@ pub fn finish(writer: &mut SpoolWriter, rows_returned: u64, truncated: bool) {
         rows_spooled: retained.map(|r| r.rows),
         spool_capped: retained.and_then(|r| r.capped),
         duration_ms: 1,
+        data_scanned_bytes,
+        engine_time_ms: data_scanned_bytes.map(|_| 42),
+        cost_estimate_usd: None,
+        cost_warning: None,
         error_code: None,
         error_message: None,
     };
