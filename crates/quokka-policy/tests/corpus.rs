@@ -863,6 +863,50 @@ mod allowlist {
     }
 }
 
+/// §7's write confirmation is the UI's to draw and this crate's to make possible: the
+/// classic disaster is a write that looks like the one you meant and is missing four
+/// words, and the classifier has to be the thing that notices.
+#[test]
+fn an_update_or_delete_with_no_where_clause_is_flagged_without_being_refused() {
+    let allow = Allowlist::none();
+    let authorized = Policy {
+        mode: AccessMode::ReadWrite,
+        surface_mode: AccessMode::ReadWrite,
+        write_requested: true,
+        allow: &allow,
+        default_schema: None,
+    };
+
+    for (sql, expected) in [
+        ("DELETE FROM orders", true),
+        ("DELETE FROM orders WHERE id = 1", false),
+        ("UPDATE orders SET total = 0", true),
+        ("UPDATE orders SET total = 0 WHERE id = 1", false),
+        // Two levels down and still missing its WHERE.
+        (
+            "WITH gone AS (DELETE FROM orders RETURNING *) SELECT * FROM gone",
+            true,
+        ),
+        // Not applicable, and so not claimed: an INSERT has nothing to filter.
+        ("INSERT INTO orders (id) VALUES (1)", false),
+        ("SELECT * FROM orders", false),
+    ] {
+        let summary = summarize(sql, Dialect::Postgres);
+        assert_eq!(
+            summary.unfiltered_write, expected,
+            "unfiltered_write for {sql:?}"
+        );
+        // And flagging is not refusing: an unfiltered write is a legitimate thing to
+        // want, and this crate says what a statement is rather than second-guessing it.
+        if summary.statement_kind.is_some() && summary.statement_count == 1 {
+            assert!(
+                matches!(authorized.decide(&summary), Outcome::Allow { .. }),
+                "{sql:?} should have been allowed with both keys turned"
+            );
+        }
+    }
+}
+
 /// Invariant 8 holds for every entry in the corpus: a fingerprint never carries a
 /// literal. Checked here as well as in the unit tests because the corpus is where the
 /// awkward statements live.

@@ -90,6 +90,15 @@ pub struct SqlSummary {
     /// removed. Empty when the text did not parse — which is why an allowlist denies
     /// unparseable text rather than finding nothing to object to.
     pub tables: Vec<TableRef>,
+    /// True for an `UPDATE` or `DELETE` with no `WHERE` clause — the classic disaster.
+    ///
+    /// Nothing in this crate refuses on it: an unfiltered write is a legitimate thing to
+    /// want and the classifier's job is to say what a statement is, not to second-guess
+    /// it. It is here because §7's write confirmation names it specifically, and that
+    /// confirmation is the UI's to draw and the classifier's to make possible. A surface
+    /// that has this can say "this will delete every row in `orders`" before it runs; one
+    /// that does not would have to parse the statement again to find out.
+    pub unfiltered_write: bool,
     /// Whether sqlparser read the text. `false` means the fingerprint came from the
     /// tokenizer and nothing below it is known.
     pub parsed: bool,
@@ -162,6 +171,7 @@ pub fn summarize(sql: &str, dialect: Dialect) -> SqlSummary {
                 read_only: walk.read_only,
                 statement_count: masked.len(),
                 tables,
+                unfiltered_write: walk.unfiltered_write,
                 parsed: true,
                 objects_enumerated: walk.objects_enumerated,
             }
@@ -186,6 +196,11 @@ pub fn summarize(sql: &str, dialect: Dialect) -> SqlSummary {
                 read_only,
                 statement_count,
                 tables: Vec::new(),
+                // Unknowable without an AST, and a surface that reads it must treat
+                // `false` as "not established" rather than as "this statement is
+                // filtered" — which is why the confirmation §7 describes is driven by
+                // `statement_kind` first and refined by this.
+                unfiltered_write: false,
                 parsed: false,
                 // Nothing was enumerated, so an allowlist has nothing to check and
                 // refuses (see the field's own note).
@@ -205,6 +220,7 @@ struct Walk {
     kind_is_a_write: bool,
     saw_a_statement: bool,
     objects_enumerated: bool,
+    unfiltered_write: bool,
     relations: Vec<TableRef>,
     /// CTE names, which look exactly like tables at the point a relation is visited and
     /// are not tables at all. `WITH recent AS (…) SELECT * FROM recent` names one table,
@@ -251,6 +267,9 @@ impl Visitor for Walk {
         let writes = read_only != Some(true);
         if !enumerates_its_objects(statement) {
             self.objects_enumerated = false;
+        }
+        if is_unfiltered_write(statement) {
+            self.unfiltered_write = true;
         }
 
         if !self.saw_a_statement || (writes && !self.kind_is_a_write) {
@@ -331,6 +350,19 @@ fn holds_a_string_literal(dialect: Dialect, rendered: &str) -> bool {
                 | Token::HexStringLiteral(_)
         )
     })
+}
+
+/// An `UPDATE` or `DELETE` that names no rows in particular.
+///
+/// Only those two: an `INSERT` has nothing to filter, and a `TRUNCATE` or a `DROP` is
+/// unmistakable from its keyword alone. What this catches is the statement that looks
+/// like the one you meant and is missing four words.
+fn is_unfiltered_write(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Update(update) => update.selection.is_none(),
+        Statement::Delete(delete) => delete.selection.is_none(),
+        _ => false,
+    }
 }
 
 /// Whether every object this statement names reaches [`Visitor::pre_visit_relation`].

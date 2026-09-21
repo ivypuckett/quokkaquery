@@ -433,14 +433,14 @@ async fn postgres_read_only_is_refused_by_the_server_itself() {
         message.contains("read-only") || message.contains("read only"),
         "the server should refuse it, not the client: {message}"
     );
+
+    postgres_read_only_is_also_refused_before_the_driver(&f).await;
 }
 
-/// And the layer above it, on the same connection: the write never reaches the driver,
-/// and the attempt is a `denied` pair in the log rather than an error from the server.
-#[tokio::test]
-async fn postgres_read_only_is_also_refused_before_the_driver() {
-    let (_c, f) = postgres("QUOKKA_TEST_PG_7").await;
-
+/// And the layer above it, on the same connection and the same container: the write never
+/// reaches the driver, and the attempt is a `denied` pair in the log rather than an error
+/// from the server. Both halves in one test because the claim is that both hold.
+async fn postgres_read_only_is_also_refused_before_the_driver(f: &Fixture) {
     let mut sink = Collect::default();
     let mut request = ExecuteRequest::new("db-ro", "INSERT INTO t VALUES (1)", actor());
     request.write = true;
@@ -465,6 +465,20 @@ async fn postgres_read_only_is_also_refused_before_the_driver() {
     assert_eq!(pair[0].event.event_kind, EventKind::QueryStarted);
     assert_eq!(pair[1].event.event_kind, EventKind::QueryFinished);
     assert_eq!(pair[1].event.status, Status::Denied);
+}
+
+async fn mysql_read_only_is_also_refused_before_the_driver(f: &Fixture) {
+    let mut sink = Collect::default();
+    let mut request = ExecuteRequest::new("db-ro", "INSERT INTO t VALUES (1)", actor());
+    request.write = true;
+
+    let err = execute(&f.engine, request, &mut sink)
+        .await
+        .expect_err("a write on a read-only connection must not run");
+    assert!(
+        matches!(&err, quokka_core::CoreError::Denied { code, .. } if *code == "policy.read_only"),
+        "{err:?}"
+    );
 }
 
 /// `quokka explain` against a real Postgres: a plan comes back, and asking for it is a
@@ -746,23 +760,8 @@ async fn mysql_read_only_is_refused_by_the_server_itself() {
         message.contains("read only") || message.contains("read-only"),
         "the server should refuse it, not the client: {message}"
     );
-}
 
-#[tokio::test]
-async fn mysql_read_only_is_also_refused_before_the_driver() {
-    let (_c, f) = mysql("QUOKKA_TEST_MY_6").await;
-
-    let mut sink = Collect::default();
-    let mut request = ExecuteRequest::new("db-ro", "INSERT INTO t VALUES (1)", actor());
-    request.write = true;
-
-    let err = execute(&f.engine, request, &mut sink)
-        .await
-        .expect_err("a write on a read-only connection must not run");
-    assert!(
-        matches!(&err, quokka_core::CoreError::Denied { code, .. } if *code == "policy.read_only"),
-        "{err:?}"
-    );
+    mysql_read_only_is_also_refused_before_the_driver(&f).await;
 }
 
 #[tokio::test]
