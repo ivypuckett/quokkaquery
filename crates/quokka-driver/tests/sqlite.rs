@@ -53,6 +53,11 @@ impl Fixture {
             },
         );
         request.max_rows = max_rows;
+        // These are driver tests, not policy tests: what is under examination here is
+        // what SQLite does with a statement, so the call-site opt-in is simply turned on
+        // and the guardrail is exercised where it lives — `quokka-policy`'s corpus, and
+        // the surface tests that check a denial is denied identically from each one.
+        request.write = true;
         let outcome = execute(&self.engine, request, &mut sink)
             .await
             .expect("execute should report the outcome, not fail");
@@ -206,27 +211,204 @@ async fn a_write_reports_rows_affected_and_a_read_does_not() {
 /// The mode is a property of the connection, so the database itself refuses the write —
 /// no policy layer needed for this one.
 #[tokio::test]
-async fn a_read_only_connection_cannot_be_written_through() {
+async fn a_read_only_connection_is_read_only_at_the_file_handle() {
     let f = fixture(&["CREATE TABLE t (a INTEGER)"]).await;
 
-    let (outcome, _) = f.run("app-ro", "INSERT INTO t VALUES (1)").await;
-    assert_eq!(outcome.status, Status::Error);
+    // Past the policy engine on purpose. M3's classifier refuses a write on a
+    // `read_only` connection before a driver is even opened, which is the layer an agent
+    // meets — and it is emphatically *not* the only layer. This asserts the other one:
+    // the file handle itself is read-only, so a write that somehow arrived would still
+    // be refused, by SQLite rather than by us.
+    let cfg = f
+        .engine
+        .registry()
+        .get("app-ro")
+        .cloned()
+        .expect("the read-only connection");
+    let driver = <quokka_driver::sqlite::SqliteDriver as quokka_core::Driver>::connect(&cfg)
+        .await
+        .expect("open the read-only connection");
+
+    let err = sqlx::query("INSERT INTO t VALUES (1)")
+        .execute(driver.pool())
+        .await
+        .expect_err("SQLite must refuse a write on a read-only handle");
     assert!(
-        outcome
-            .error_message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("readonly"),
-        "{:?}",
-        outcome.error_message
+        err.to_string().contains("readonly"),
+        "the file handle should have refused it: {err}"
+    );
+}
+
+/// And the layer above it: the same write never reaches the driver at all, and the
+/// attempt is in the log as a denial rather than as an error.
+#[tokio::test]
+async fn a_write_to_a_read_only_connection_is_denied_before_any_driver_is_opened() {
+    let f = fixture(&["CREATE TABLE t (a INTEGER)"]).await;
+
+    let mut sink = Collect::default();
+    let mut request = ExecuteRequest::new(
+        "app-ro",
+        "INSERT INTO t VALUES (1)",
+        Actor {
+            kind: ActorKind::Agent,
+            id: "claude".to_string(),
+        },
+    );
+    // Asking for it makes no difference: the mode is the authorization, and only a
+    // human editing the config file can change that.
+    request.write = true;
+
+    let err = execute(&f.engine, request, &mut sink)
+        .await
+        .expect_err("a write on a read-only connection must not run");
+    let query_id = match &err {
+        quokka_core::CoreError::Denied { code, query_id, .. } => {
+            assert_eq!(*code, "policy.read_only");
+            *query_id
+        }
+        other => panic!("expected a denial, got {other:?}"),
+    };
+
+    // Invariant 5's shape, unchanged by the denial: two events, one query_id, and the
+    // `queries` view sees a finish rather than an unfinished query.
+    let events = quokka_core::events_for_query(&f.engine, query_id)
+        .await
+        .expect("events");
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].event.status, Status::Denied);
+    assert!(f.engine.audit().verify().await.expect("verify").is_intact());
+}
+
+/// The hole M3 closes, and why it needed closing twice.
+///
+/// The first assertion is the thing itself: `sqlx-sqlite` walks the statement tail even
+/// on the prepared path, so a stacked body really does run all of it. That is what made
+/// the old `raw_sql` route a hole rather than an inelegance, and it is why the driver
+/// refuses a stacked body itself instead of trusting that preparing one is enough.
+///
+/// The second is the guardrail at its proper layer: through `execute()` the body never
+/// reaches a driver at all, and the attempt is logged as a denial.
+#[tokio::test]
+async fn a_stacked_body_is_refused_by_the_driver_and_never_reaches_it_through_execute() {
+    let f = fixture(&["CREATE TABLE t (a INTEGER)", "INSERT INTO t VALUES (1)"]).await;
+
+    let cfg = f
+        .engine
+        .registry()
+        .get("app")
+        .cloned()
+        .expect("the read-write connection");
+    let driver = <quokka_driver::sqlite::SqliteDriver as quokka_core::Driver>::connect(&cfg)
+        .await
+        .expect("open");
+
+    // Past both guardrails, straight at sqlx: this is the behaviour being defended
+    // against, asserted so that a future sqlx release changing it is visible here rather
+    // than silently making a comment wrong.
+    sqlx::query("SELECT 1; DROP TABLE t")
+        .execute(driver.pool())
+        .await
+        .expect("sqlx runs the whole body");
+    let dropped = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM t")
+        .fetch_one(driver.pool())
+        .await
+        .is_err();
+    assert!(
+        dropped,
+        "sqlx-sqlite no longer runs the tail of a stacked body — the driver's own check \
+         may now be unnecessary, but check before removing it"
     );
 
-    // And it is logged like any other attempt.
+    // And through the one execute path, on a fresh table, it does not get that far.
+    let f = fixture(&["CREATE TABLE t (a INTEGER)", "INSERT INTO t VALUES (1)"]).await;
+    let mut sink = Collect::default();
+    let request = ExecuteRequest::new(
+        "app",
+        "SELECT 1; DROP TABLE t",
+        Actor {
+            kind: ActorKind::Agent,
+            id: "claude".to_string(),
+        },
+    );
+    let err = execute(&f.engine, request, &mut sink)
+        .await
+        .expect_err("a stacked body must be refused");
+    assert!(
+        matches!(&err, quokka_core::CoreError::Denied { code, .. }
+                 if *code == "policy.multiple_statements"),
+        "{err:?}"
+    );
+
+    let (still_there, _) = f.run("app", "SELECT count(*) FROM t").await;
+    assert_eq!(still_there.rows_returned, 1);
+}
+
+/// `quokka explain`, end to end: the plan comes back, and asking for it leaves the two
+/// events a query leaves (invariant 1 binds it, because it runs SQL).
+#[tokio::test]
+async fn explain_returns_a_plan_and_logs_a_query_pair() {
+    let f = fixture(&[
+        "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)",
+        "INSERT INTO t VALUES (1, 'x')",
+    ])
+    .await;
+
+    let outcome = quokka_core::explain(
+        &f.engine,
+        quokka_core::ExplainRequest::new(
+            "app",
+            "SELECT * FROM t WHERE a = 1",
+            Actor {
+                kind: ActorKind::Human,
+                id: "tester".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect("explain");
+
+    assert!(
+        outcome.plan.text.to_uppercase().contains("T"),
+        "the plan should mention the table: {:?}",
+        outcome.plan.text
+    );
+
     let events = quokka_core::events_for_query(&f.engine, outcome.query_id)
         .await
         .expect("events");
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].event.status, Status::Error);
+    assert_eq!(events[0].event.statement_kind.as_deref(), Some("explain"));
+    assert!(events[0]
+        .event
+        .sql_fingerprint
+        .starts_with("EXPLAIN SELECT"));
+    assert_eq!(events[1].event.status, Status::Ok);
+}
+
+/// Explaining a write needs the same authorization as running one — the decision
+/// `quokka_core::explain` documents, asserted so it cannot drift.
+#[tokio::test]
+async fn explaining_a_write_on_a_read_only_connection_is_denied() {
+    let f = fixture(&["CREATE TABLE t (a INTEGER)"]).await;
+
+    let err = quokka_core::explain(
+        &f.engine,
+        quokka_core::ExplainRequest::new(
+            "app-ro",
+            "DELETE FROM t",
+            Actor {
+                kind: ActorKind::Agent,
+                id: "claude".to_string(),
+            },
+        ),
+    )
+    .await
+    .expect_err("explaining a delete on a read-only connection must be refused");
+
+    assert!(
+        matches!(&err, quokka_core::CoreError::Denied { code, .. } if *code == "policy.read_only"),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -355,6 +537,7 @@ impl Fixture {
         );
         request.max_rows = u64::MAX;
         request.params = params;
+        request.write = true;
         let outcome = execute(&self.engine, request, &mut sink)
             .await
             .expect("execute should report the outcome, not fail");

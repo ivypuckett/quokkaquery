@@ -1,0 +1,38 @@
+[package]
+name = "quokka-mcp"
+description = "QuokkaQuery's stdio MCP server: the audited query path, as tools an agent can call"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+quokka-audit.workspace = true
+quokka-core.workspace = true
+quokka-spool.workspace = true
+
+# `rmcp` 3.x (§6.2), Apache-2.0. `server` brings the tool system and `schemars`;
+# `transport-io` is the stdio transport and nothing else — no HTTP server, no `reqwest`,
+# no TLS stack. Default features are off so `base64` and the client half stay out of a
+# build that only ever speaks over a pipe.
+rmcp = { workspace = true, default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+] }
+
+futures.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+
+[dev-dependencies]
+quokka-driver = { workspace = true, features = ["sqlite"] }
+sqlx = { workspace = true, features = ["sqlite"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -77,33 +77,10 @@ impl TlsMode {
     }
 }
 
-/// Whether a connection may be written to.
-///
-/// The mode binds every surface identically (invariant 9): read-only means read-only for
-/// the human at the UI as much as for an agent. Statement classification and denial land
-/// with `quokka-policy` at M3; at M0 the mode is recorded on every audit row, and a
-/// read-only SQLite connection is opened read-only by the driver, which the database
-/// itself then enforces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccessMode {
-    #[default]
-    ReadOnly,
-    ReadWrite,
-}
-
-impl AccessMode {
-    pub fn is_read_only(self) -> bool {
-        matches!(self, AccessMode::ReadOnly)
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AccessMode::ReadOnly => "read_only",
-            AccessMode::ReadWrite => "read_write",
-        }
-    }
-}
+/// Whether a connection may be written to, and the guardrails that ride with it, live
+/// in `quokka-policy` — the crate `execute()` consults before it issues a permit — and
+/// are re-exported here so `quokka_core::AccessMode` still resolves.
+pub use quokka_policy::{AccessMode, Allowlist, Limits};
 
 /// One configured connection.
 ///
@@ -131,6 +108,13 @@ pub struct ConnectionConfig {
     pub tls: TlsMode,
     pub mode: AccessMode,
     pub sql_logging: SqlLogging,
+    /// Server-side caps on rows and time (§6.3), which a request may lower and never
+    /// raise. Human-only, like everything else here (invariant 7): a cap an agent can
+    /// raise is a cap it does not have.
+    pub limits: Limits,
+    /// Which schemas and tables this connection's statements may name (§6.3). Empty by
+    /// default, in which case the mode alone governs.
+    pub allow: Allowlist,
     /// Recorded on every audit row for this connection, and, for the wire-protocol
     /// drivers, the database actually connected to.
     pub database: Option<String>,
@@ -164,6 +148,8 @@ impl ConnectionConfig {
             tls: TlsMode::default(),
             mode: AccessMode::default(),
             sql_logging: SqlLogging::default(),
+            limits: Limits::default(),
+            allow: Allowlist::none(),
             database: None,
             schema: None,
             catalog_ttl: DEFAULT_CATALOG_TTL,
@@ -274,6 +260,19 @@ struct ConnectionFile {
     /// `fingerprint` unless the connection opted in — invariant 8.
     #[serde(default, deserialize_with = "de_sql_logging")]
     sql_logging: SqlLogging,
+    /// Most rows any one query on this connection may read. A request may ask for
+    /// fewer and can never ask for more.
+    #[serde(default)]
+    max_rows: Option<u64>,
+    /// How long a statement may run before it is cancelled. `"30s"`, `"5m"`.
+    #[serde(default)]
+    timeout: Option<String>,
+    /// Schemas this connection's statements may name. Empty means no allowlist.
+    #[serde(default)]
+    allow_schemas: Vec<String>,
+    /// Tables this connection's statements may name, as `table` or `schema.table`.
+    #[serde(default)]
+    allow_tables: Vec<String>,
     #[serde(default)]
     database: Option<String>,
     #[serde(default)]
@@ -477,6 +476,25 @@ impl Registry {
                 None => DEFAULT_CONNECT_TIMEOUT,
             };
 
+            let timeout = match &c.timeout {
+                Some(text) => Some(parse_duration(text).ok_or_else(|| {
+                    bad(format!(
+                        "timeout {text:?} is not a duration; write it as \"30s\", \"5m\" \
+                         or \"1h\""
+                    ))
+                })?),
+                None => None,
+            };
+            if c.max_rows == Some(0) {
+                return Err(bad(
+                    "max_rows = 0 would read nothing at all; remove the setting to leave \
+                     the caller's own bound in force"
+                        .to_string(),
+                ));
+            }
+            let allow =
+                Allowlist::new(c.allow_schemas.clone(), c.allow_tables.clone()).map_err(bad)?;
+
             let cfg = ConnectionConfig {
                 name: name.clone(),
                 driver: c.driver,
@@ -488,6 +506,11 @@ impl Registry {
                 tls: c.tls,
                 mode: c.mode,
                 sql_logging: c.sql_logging,
+                limits: Limits {
+                    max_rows: c.max_rows,
+                    timeout,
+                },
+                allow,
                 database: c.database,
                 schema: c.schema,
                 catalog_ttl,
@@ -549,6 +572,11 @@ fn audit_connection(audit_db: &Path) -> ConnectionConfig {
         tls: TlsMode::Disable,
         mode: AccessMode::ReadOnly,
         sql_logging: SqlLogging::Fingerprint,
+        // No caps and no allowlist: reading the log is the cheapest query in the
+        // program, and an allowlist over `audit_log` and `queries` would only stop
+        // someone reviewing their own trail.
+        limits: Limits::default(),
+        allow: Allowlist::none(),
         database: Some("audit".to_string()),
         schema: None,
         catalog_ttl: DEFAULT_CATALOG_TTL,

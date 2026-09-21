@@ -78,6 +78,77 @@ jobs:
       - name: cargo test --features docker-tests
         run: cargo test --package quokka-driver --features docker-tests
 
+  mcp:
+    name: the MCP server speaks the protocol
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # The tool tests in `quokka-mcp` call the tools directly, which is the right level
+      # for the claims they make — one execution per result, a denial denied identically
+      # here and at the CLI. What they cannot check is that the *transport* works: that
+      # `quokka mcp` speaks JSON-RPC over stdio, that its schemas serialize, and that
+      # nothing but protocol reaches stdout. A handshake and two calls over a real pipe
+      # cover exactly that gap, and it is the failure a user would meet first.
+      - name: a real client handshake over stdio
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          python3 - "$work" <<'PY'
+          import sqlite3, sys
+          db = sys.argv[1] + "/app.db"
+          c = sqlite3.connect(db)
+          c.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)")
+          c.executemany("INSERT INTO orders VALUES (?, ?)", [(i, i * 1.5) for i in range(1, 600)])
+          c.commit()
+          c.close()
+          PY
+          cat > "$work/config.toml" <<EOF
+          [connections.app]
+          driver = "sqlite"
+          path = "$work/app.db"
+          credential = "none"
+          EOF
+          cat > "$work/calls.jsonl" <<'EOF'
+          {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}
+          {"jsonrpc":"2.0","method":"notifications/initialized"}
+          {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+          {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"query","arguments":{"connection":"app","sql":"SELECT * FROM orders"}}}
+          {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query","arguments":{"connection":"app","sql":"DELETE FROM orders","write":true}}}
+          EOF
+          cargo build --package quokkaquery
+          QUOKKA_CONFIG="$work/config.toml"           QUOKKA_AUDIT_DB="$work/audit.db"           QUOKKA_CACHE_DIR="$work/cache"             ./target/debug/quokka mcp < "$work/calls.jsonl" > "$work/out.jsonl"
+          python3 - "$work/out.jsonl" <<'PY'
+          import json, sys
+
+          by_id = {}
+          for line in open(sys.argv[1]):
+              line = line.strip()
+              if not line:
+                  continue
+              # Anything that is not JSON-RPC on stdout is corruption of the transport.
+              message = json.loads(line)
+              if "id" in message:
+                  by_id[message["id"]] = message
+
+          assert by_id[1]["result"]["serverInfo"]["name"] == "quokkaquery", by_id[1]
+          names = sorted(t["name"] for t in by_id[2]["result"]["tools"])
+          assert names == [
+              "describe_table", "explain", "export", "list_connections",
+              "list_schemas", "query", "search_audit",
+          ], names
+
+          page = json.loads(by_id[3]["result"]["content"][0]["text"])
+          assert len(page["rows"]) == 512, len(page["rows"])
+          assert page["rows_in_view"] == 599, page["rows_in_view"]
+          assert page["next_cursor"], "a second page should be reachable"
+
+          denied = by_id[4]["error"]
+          assert denied["data"]["code"] == "policy.read_only", denied
+          print("the MCP transport works, the cap holds, and a write is refused")
+          PY
+
   headless:
     name: headless build has no GUI dependencies
     runs-on: ubuntu-latest

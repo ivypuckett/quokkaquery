@@ -5,6 +5,8 @@ members = [
     "crates/quokka-driver",
     "crates/quokka-audit",
     "crates/quokka-spool",
+    "crates/quokka-policy",
+    "crates/quokka-mcp",
     "crates/quokka-cli",
 ]
 
@@ -22,6 +24,8 @@ quokka-core = { path = "crates/quokka-core", version = "0.0.1" }
 quokka-driver = { path = "crates/quokka-driver", version = "0.0.1" }
 quokka-audit = { path = "crates/quokka-audit", version = "0.0.1" }
 quokka-spool = { path = "crates/quokka-spool", version = "0.0.1" }
+quokka-policy = { path = "crates/quokka-policy", version = "0.0.1" }
+quokka-mcp = { path = "crates/quokka-mcp", version = "0.0.1" }
 
 anyhow = "1"
 async-trait = "0.1"
@@ -34,6 +38,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sqlparser = { version = "0.63", features = ["visitor"] }
+# The MCP server (§6.2). Apache-2.0, pure Rust, and taken without default features so
+# only the stdio transport and the server half of the SDK reach the tree.
+rmcp = { version = "3", default-features = false }
+# rmcp derives its tool schemas with this, and the derive macro resolves `schemars::`
+# from the using crate — so it is a direct dependency rather than one reached through
+# `rmcp::schemars`. Pinned to the same major version rmcp asks for; two of them in the
+# tree would produce two incompatible `JsonSchema` traits and a very confusing error.
+schemars = "1"
 # `tls-rustls-ring-native-roots`, not native-tls: §3.0 wants no linking against system
 # client libraries, and rustls is pure Rust. The *roots* still come from the OS trust
 # store, because the databases people actually connect to are as often behind a company

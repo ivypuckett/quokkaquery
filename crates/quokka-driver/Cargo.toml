@@ -28,6 +28,10 @@ docker-tests = ["postgres", "mysql", "dep:testcontainers", "dep:testcontainers-m
 
 [dependencies]
 quokka-core.workspace = true
+# For the statement *count* only, in the one driver whose protocol lets a stacked body
+# through (see `sqlite::execute`). A leaf crate of pure functions with no I/O, so this
+# does not give a driver a way to reach anything.
+quokka-policy.workspace = true
 
 async-trait.workspace = true
 futures.workspace = true

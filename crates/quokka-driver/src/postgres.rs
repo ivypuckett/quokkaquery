@@ -320,10 +320,29 @@ impl Driver for PostgresDriver {
         Ok(())
     }
 
-    async fn explain(&self, _permit: &ExecutePermit, _sql: &str) -> Result<Plan, DriverError> {
-        Err(DriverError::Unsupported(
-            "EXPLAIN arrives with the policy engine at M3".to_string(),
-        ))
+    /// A plain `EXPLAIN`, in the default text format.
+    ///
+    /// Never `ANALYZE`, and the reason is worth stating rather than leaving to the
+    /// reader of the format string: `EXPLAIN ANALYZE` *runs* the statement it explains,
+    /// so on this path it would turn "show me what this delete would do" into doing it.
+    /// The prefix is written here rather than taken from the caller, so there is no
+    /// spelling of the tool's arguments that reaches `ANALYZE`.
+    async fn explain(&self, _permit: &ExecutePermit, sql: &str) -> Result<Plan, DriverError> {
+        let rows = sqlx::query(AssertSqlSafe(format!("EXPLAIN {sql}")))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(execute_error)?;
+
+        let text = rows
+            .iter()
+            .map(|row| row.try_get::<String, _>(0).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        Ok(Plan {
+            dialect: quokka_core::Dialect::Postgres,
+            text,
+        })
     }
 }
 

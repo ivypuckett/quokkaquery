@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 quokka-audit.workspace = true
+quokka-policy.workspace = true
 
 argon2.workspace = true
 async-trait.workspace = true
@@ -24,7 +25,7 @@ serde_json.workspace = true
 sqlparser.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 toml.workspace = true
 uuid.workspace = true
 zeroize.workspace = true

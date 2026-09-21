@@ -21,9 +21,9 @@ pub mod value;
 
 pub use catalog::CatalogCache;
 pub use config::{
-    default_config_path, default_port, dialect_hint, AccessMode, Config, ConnectionConfig,
-    Registry, SpoolConfig, TlsMode, AUDIT_CONNECTION, DEFAULT_CATALOG_TTL, DEFAULT_CONNECT_TIMEOUT,
-    DEFAULT_SPOOL_MAX_BYTES, DEFAULT_SPOOL_MAX_ROWS,
+    default_config_path, default_port, dialect_hint, AccessMode, Allowlist, Config,
+    ConnectionConfig, Limits, Registry, SpoolConfig, TlsMode, AUDIT_CONNECTION,
+    DEFAULT_CATALOG_TTL, DEFAULT_CONNECT_TIMEOUT, DEFAULT_SPOOL_MAX_BYTES, DEFAULT_SPOOL_MAX_ROWS,
 };
 pub use credential::{Backend as CredentialBackend, CredentialError, CredentialRef};
 pub use driver::{
@@ -31,13 +31,18 @@ pub use driver::{
     QueryStream, ResultMeta, Scope, TableInfo,
 };
 pub use engine::{
-    events_for_query, execute, introspect, Actor, Cap, CatalogResult, Engine, ExecuteRequest,
-    IntrospectRequest, NullSink, Outcome, Retained, RowSink, DEFAULT_MAX_ROWS,
+    events_for_query, execute, explain, introspect, Actor, Cap, CatalogResult, Engine,
+    ExecuteRequest, ExplainOutcome, ExplainRequest, IntrospectRequest, NullSink, Outcome, Retained,
+    RowSink, DEFAULT_MAX_ROWS,
 };
 pub use error::{CoreError, DriverError};
 pub use export::{record_export, ExportRecord};
 pub use secret::Secret;
-pub use sql::{summarize, SqlSummary};
+pub use sql::{summarize, SqlSummary, TableRef};
+// The policy engine's own vocabulary, so a surface rendering a denial does not have to
+// depend on `quokka-policy` directly — and, more to the point, cannot be tempted to call
+// it instead of going through `execute()`.
+pub use quokka_policy::Denial;
 pub use value::{Column, Dialect, Row, Value};
 
 // Re-exported so surfaces and drivers speak one audit vocabulary without depending on

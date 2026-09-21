@@ -102,10 +102,32 @@ impl Fixture {
         let mut request = ExecuteRequest::new(connection, sql, actor());
         request.max_rows = u64::MAX;
         request.params = params;
+        // Driver tests, not policy tests: the guardrail is exercised in
+        // `quokka-policy`'s corpus and in the surface tests, and what is under
+        // examination here is what a real server does with a statement.
+        request.write = true;
         let outcome = execute(&self.engine, request, &mut sink)
             .await
             .expect("execute reports the outcome rather than failing");
         (outcome, sink)
+    }
+
+    /// Run several statements in turn, asserting each one.
+    ///
+    /// One call per statement, because a query *is* one statement now: M3 refuses a
+    /// stacked body before it reaches a driver (§6.3), and these fixtures used to lean on
+    /// the hole that let one through. Which is the guardrail working — it caught the test
+    /// suite that set it up.
+    async fn setup(&self, connection: &str, statements: &[&str]) {
+        for sql in statements {
+            let (outcome, _) = self.run(connection, sql).await;
+            assert_eq!(
+                outcome.status,
+                Status::Ok,
+                "setup failed on {sql:?}: {:?}",
+                outcome.error_message
+            );
+        }
     }
 
     async fn catalog(&self, connection: &str, table: Option<&str>) -> Catalog {
@@ -214,15 +236,15 @@ async fn postgres_runs_a_query_end_to_end_and_logs_both_events() {
 async fn postgres_renders_every_exotic_type_as_text_rather_than_failing() {
     let (_c, f) = postgres("QUOKKA_TEST_PG_2").await;
 
-    let (setup, _) = f
-        .run(
-            "db",
-            "CREATE EXTENSION IF NOT EXISTS hstore; \
-             CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy'); \
-             CREATE TYPE point3 AS (x int, y int, z int);",
-        )
-        .await;
-    assert_eq!(setup.status, Status::Ok, "{:?}", setup.error_message);
+    f.setup(
+        "db",
+        &[
+            "CREATE EXTENSION IF NOT EXISTS hstore",
+            "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')",
+            "CREATE TYPE point3 AS (x int, y int, z int)",
+        ],
+    )
+    .await;
 
     let (outcome, sink) = f
         .run(
@@ -347,11 +369,13 @@ async fn postgres_binds_parameters_including_a_null_of_inferred_type() {
 async fn postgres_introspection_leaves_exactly_one_event() {
     let (_c, f) = postgres("QUOKKA_TEST_PG_4").await;
 
-    f.run(
+    f.setup(
         "db",
-        "CREATE TABLE orders (id serial PRIMARY KEY, email text NOT NULL, \
-         total numeric(10,2), tags text[]); \
-         CREATE VIEW big AS SELECT * FROM orders;",
+        &[
+            "CREATE TABLE orders (id serial PRIMARY KEY, email text NOT NULL, \
+             total numeric(10,2), tags text[])",
+            "CREATE VIEW big AS SELECT * FROM orders",
+        ],
     )
     .await;
 
@@ -398,25 +422,112 @@ async fn postgres_introspection_leaves_exactly_one_event() {
     assert!(kinds.contains(&("big", "view")), "{kinds:?}");
 }
 
-/// Invariant 9, enforced by the server rather than by us declining to send the write.
+/// Invariant 9's *lower* layer: the server refuses the write, not us declining to send
+/// it.
+///
+/// This reaches past `quokka-policy` on purpose. M3's classifier refuses a write on a
+/// `read_only` connection before a driver is opened, which is the layer an agent meets;
+/// the guarantee is that both layers hold, so this one is asserted where it lives —
+/// against a real server, with `default_transaction_read_only` doing the refusing.
 #[tokio::test]
 async fn postgres_read_only_is_refused_by_the_server_itself() {
     let (_c, f) = postgres("QUOKKA_TEST_PG_5").await;
     f.run("db", "CREATE TABLE t (a int)").await;
 
-    let (outcome, _) = f.run("db-ro", "INSERT INTO t VALUES (1)").await;
-    assert_eq!(outcome.status, Status::Error);
-    let message = outcome.error_message.unwrap_or_default();
+    let cfg = f
+        .engine
+        .registry()
+        .get("db-ro")
+        .cloned()
+        .expect("the read-only connection");
+    let driver = <quokka_driver::postgres::PostgresDriver as quokka_core::Driver>::connect(&cfg)
+        .await
+        .expect("open the read-only connection");
+
+    let err = sqlx::query("INSERT INTO t VALUES (1)")
+        .execute(driver.pool())
+        .await
+        .expect_err("the server must refuse a write on a read-only session");
+    let message = err.to_string().to_lowercase();
     assert!(
-        message.to_lowercase().contains("read-only"),
+        message.contains("read-only") || message.contains("read only"),
         "the server should refuse it, not the client: {message}"
     );
 
-    // And the denial is in the log, which is the point of refusing rather than hiding.
+    postgres_read_only_is_also_refused_before_the_driver(&f).await;
+}
+
+/// And the layer above it, on the same connection and the same container: the write never
+/// reaches the driver, and the attempt is a `denied` pair in the log rather than an error
+/// from the server. Both halves in one test because the claim is that both hold.
+async fn postgres_read_only_is_also_refused_before_the_driver(f: &Fixture) {
+    let mut sink = Collect::default();
+    let mut request = ExecuteRequest::new("db-ro", "INSERT INTO t VALUES (1)", actor());
+    request.write = true;
+
+    let err = execute(&f.engine, request, &mut sink)
+        .await
+        .expect_err("a write on a read-only connection must not run");
+    let query_id = match &err {
+        quokka_core::CoreError::Denied { code, query_id, .. } => {
+            assert_eq!(*code, "policy.read_only");
+            *query_id
+        }
+        other => panic!("expected a denial, got {other:?}"),
+    };
+
     let events = f.events().await;
-    let last = &events.last().expect("event").event;
-    assert_eq!(last.event_kind, EventKind::QueryFinished);
-    assert_eq!(last.status, Status::Error);
+    let pair: Vec<_> = events
+        .iter()
+        .filter(|e| e.event.query_id == query_id)
+        .collect();
+    assert_eq!(pair.len(), 2);
+    assert_eq!(pair[0].event.event_kind, EventKind::QueryStarted);
+    assert_eq!(pair[1].event.event_kind, EventKind::QueryFinished);
+    assert_eq!(pair[1].event.status, Status::Denied);
+}
+
+async fn mysql_read_only_is_also_refused_before_the_driver(f: &Fixture) {
+    let mut sink = Collect::default();
+    let mut request = ExecuteRequest::new("db-ro", "INSERT INTO t VALUES (1)", actor());
+    request.write = true;
+
+    let err = execute(&f.engine, request, &mut sink)
+        .await
+        .expect_err("a write on a read-only connection must not run");
+    assert!(
+        matches!(&err, quokka_core::CoreError::Denied { code, .. } if *code == "policy.read_only"),
+        "{err:?}"
+    );
+}
+
+/// `quokka explain` against a real Postgres: a plan comes back, and asking for it is a
+/// query pair like any other (invariant 1).
+#[tokio::test]
+async fn postgres_explain_returns_a_plan_on_the_audited_path() {
+    let (_c, f) = postgres("QUOKKA_TEST_PG_8").await;
+    f.run("db", "CREATE TABLE t (a int)").await;
+
+    let outcome = quokka_core::explain(
+        &f.engine,
+        quokka_core::ExplainRequest::new("db", "SELECT * FROM t WHERE a = 1", actor()),
+    )
+    .await
+    .expect("explain");
+
+    assert!(
+        outcome.plan.text.to_lowercase().contains("scan"),
+        "a Postgres plan should mention a scan: {:?}",
+        outcome.plan.text
+    );
+
+    let events = f.events().await;
+    let pair: Vec<_> = events
+        .iter()
+        .filter(|e| e.event.query_id == outcome.query_id)
+        .collect();
+    assert_eq!(pair.len(), 2);
+    assert_eq!(pair[0].event.statement_kind.as_deref(), Some("explain"));
 }
 
 #[tokio::test]
@@ -643,17 +754,58 @@ async fn mysql_introspection_leaves_exactly_one_event() {
     );
 }
 
+/// The same pair of layers on MySQL, where the lower one is `SET SESSION TRANSACTION
+/// READ ONLY` rather than `default_transaction_read_only`.
 #[tokio::test]
 async fn mysql_read_only_is_refused_by_the_server_itself() {
     let (_c, f) = mysql("QUOKKA_TEST_MY_5").await;
     f.run("db", "CREATE TABLE t (a int)").await;
 
-    let (outcome, _) = f.run("db-ro", "INSERT INTO t VALUES (1)").await;
-    assert_eq!(outcome.status, Status::Error);
-    let message = outcome.error_message.unwrap_or_default();
+    let cfg = f
+        .engine
+        .registry()
+        .get("db-ro")
+        .cloned()
+        .expect("the read-only connection");
+    let driver = <quokka_driver::mysql::MySqlDriver as quokka_core::Driver>::connect(&cfg)
+        .await
+        .expect("open the read-only connection");
+
+    let err = sqlx::query("INSERT INTO t VALUES (1)")
+        .execute(driver.pool())
+        .await
+        .expect_err("the server must refuse a write on a read-only session");
+    let message = err.to_string().to_lowercase();
     assert!(
-        message.to_lowercase().contains("read only")
-            || message.to_lowercase().contains("read-only"),
+        message.contains("read only") || message.contains("read-only"),
         "the server should refuse it, not the client: {message}"
     );
+
+    mysql_read_only_is_also_refused_before_the_driver(&f).await;
+}
+
+#[tokio::test]
+async fn mysql_explain_returns_a_plan_on_the_audited_path() {
+    let (_c, f) = mysql("QUOKKA_TEST_MY_7").await;
+    f.run("db", "CREATE TABLE t (a int)").await;
+
+    let outcome = quokka_core::explain(
+        &f.engine,
+        quokka_core::ExplainRequest::new("db", "SELECT * FROM t WHERE a = 1", actor()),
+    )
+    .await
+    .expect("explain");
+
+    assert!(
+        !outcome.plan.text.is_empty(),
+        "MySQL should have said something about the plan"
+    );
+
+    let events = f.events().await;
+    let pair: Vec<_> = events
+        .iter()
+        .filter(|e| e.event.query_id == outcome.query_id)
+        .collect();
+    assert_eq!(pair.len(), 2);
+    assert_eq!(pair[0].event.statement_kind.as_deref(), Some("explain"));
 }

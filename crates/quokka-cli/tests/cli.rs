@@ -40,6 +40,13 @@ impl Workspace {
                  mode = \"read_write\"\n\
                  credential = \"none\"\n\
                  \n\
+                 # The same file, read-only: the default posture, and the one a\n\
+                 # denial is asserted against.\n\
+                 [connections.app-ro]\n\
+                 driver = \"sqlite\"\n\
+                 path = {:?}\n\
+                 credential = \"none\"\n\
+                 \n\
                  [connections.app-full]\n\
                  driver = \"sqlite\"\n\
                  path = {:?}\n\
@@ -55,6 +62,7 @@ impl Workspace {
                  user = \"reader\"\n\
                  credential = \"env:QUOKKA_TEST_PASSWORD\"\n\
                  connect_timeout = \"1s\"\n",
+                app_db.to_string_lossy(),
                 app_db.to_string_lossy(),
                 app_db.to_string_lossy()
             ),
@@ -284,15 +292,18 @@ async fn max_rows_truncates_and_never_does_so_silently() {
 async fn a_failing_query_exits_one_and_is_still_logged() {
     let w = Workspace::new().await;
 
+    // A statement the classifier reads perfectly well and the database refuses, so the
+    // failure under test is the query's rather than the guardrail's — those exit
+    // differently now, and on purpose (§6.1).
     let out = w.quokka(&[
         "query",
         "--connection",
         "app",
-        "SELEKT 1",
+        "SELECT * FROM no_such_table",
         "--format",
         "json",
     ]);
-    assert_eq!(code(&out), 1);
+    assert_eq!(code(&out), 1, "stderr: {}", stderr(&out));
     let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
     assert_eq!(envelope["status"], "error");
 
@@ -334,8 +345,14 @@ async fn the_audit_connection_cannot_be_written_through() {
         "UPDATE audit_log SET actor_id = 'mallory'",
         "DROP TABLE audit_log",
     ] {
-        let out = w.quokka(&["query", "--connection", "@audit", sql]);
-        assert_eq!(code(&out), 1, "{sql} should have been refused");
+        // `--write` and all: `@audit` is `read_only` and the opt-in cannot widen that.
+        let out = w.quokka(&["query", "--connection", "@audit", sql, "--write"]);
+        assert_eq!(
+            code(&out),
+            6,
+            "{sql} should have been denied: {}",
+            stderr(&out)
+        );
     }
 
     let out = w.quokka(&["audit", "verify"]);
@@ -659,7 +676,7 @@ async fn connections_list_names_every_connection_without_connecting_to_any() {
         .iter()
         .map(|c| c["name"].as_str().expect("name"))
         .collect();
-    assert_eq!(names, ["@audit", "app", "app-full", "prod"]);
+    assert_eq!(names, ["@audit", "app", "app-full", "app-ro", "prod"]);
 
     // `prod` points at a closed port. Listing it succeeded, so nothing dialled it — and
     // the log agrees, because nothing reached a database to log.
@@ -793,6 +810,7 @@ async fn no_result_data_reaches_the_log_after_an_export() {
         "INSERT INTO orders (id, email, total) VALUES (99, ?, 1.0)",
         "--param",
         &format!("text:{NEEDLE}"),
+        "--write",
     ]);
     assert_eq!(code(&seed), 0, "stderr: {}", stderr(&seed));
 
@@ -1215,6 +1233,7 @@ async fn a_part_written_export_logs_the_rows_that_reached_the_file() {
         "app",
         "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
          INSERT INTO orders (id, email, total) SELECT i + 1000, 'x@y.example', i FROM n",
+        "--write",
     ]);
     assert_eq!(code(&seed), 0, "stderr: {}", stderr(&seed));
 
@@ -1249,4 +1268,331 @@ async fn a_part_written_export_logs_the_rows_that_reached_the_file() {
         written < 2002,
         "the export cannot have written more rows than the result holds"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M3: the guardrail, and the same guardrail from the other surface
+// ---------------------------------------------------------------------------
+
+/// The CLI half of "the mode binds every surface identically". The MCP half is below.
+#[tokio::test]
+async fn a_write_to_a_read_only_connection_is_denied_with_its_own_exit_code() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app-ro",
+        "INSERT INTO orders (id) VALUES (3)",
+        "--write",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(
+        code(&out),
+        6,
+        "a denial is neither a usage error nor a failed query: {}",
+        stderr(&out)
+    );
+
+    let envelope: Json = serde_json::from_str(stderr(&out).trim()).expect("a JSON error");
+    assert_eq!(envelope["denied"], Json::Bool(true));
+    assert_eq!(envelope["code"], "policy.read_only");
+
+    // And it is in the log as a denial rather than as an error.
+    let out = w.quokka(&[
+        "audit",
+        "query",
+        "SELECT count(*) AS n FROM audit_log WHERE status = 'denied'",
+        "--format",
+        "json",
+    ]);
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(envelope["rows"][0]["n"], 1);
+}
+
+/// The same write, against the same connection and the same audit log, refused with the
+/// same code from the CLI and from the MCP server. One guardrail, two surfaces, and the
+/// test says so in one place rather than leaving the reader to compare two.
+#[tokio::test]
+async fn the_mode_binds_the_cli_and_mcp_identically() {
+    use std::sync::Arc;
+
+    let w = Workspace::new().await;
+    const SQL: &str = "INSERT INTO orders (id) VALUES (7)";
+
+    // Through the binary.
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app-ro",
+        SQL,
+        "--write",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 6);
+    let from_cli: Json = serde_json::from_str(stderr(&out).trim()).expect("JSON");
+
+    // Through the MCP server, over the same config and the same log.
+    let audit = quokka_core::AuditLog::open(w.audit_db())
+        .await
+        .expect("audit log");
+    let config = quokka_core::Config::load(Some(&w.dir.path().join("config.toml")), &w.audit_db())
+        .expect("config");
+    let engine = Arc::new(quokka_core::Engine::new(
+        config.registry,
+        audit,
+        quokka_driver::builtin_factories(),
+    ));
+    let spools = Arc::new(
+        quokka_spool::SpoolSet::open(
+            Some(&w.dir.path().join("cache-mcp")),
+            quokka_spool::Limits::from(config.spool),
+        )
+        .await
+        .expect("spools"),
+    );
+    let server = quokka_mcp::QuokkaMcp::new(
+        engine,
+        spools,
+        quokka_core::Actor {
+            kind: quokka_core::ActorKind::Agent,
+            id: "claude".to_string(),
+        },
+        // The most permissive posture an MCP server can have, so that what refuses the
+        // write is the connection and nothing else.
+        quokka_core::AccessMode::ReadWrite,
+    );
+
+    let args = serde_json::json!({
+        "connection": "app-ro",
+        "sql": SQL,
+        "write": true,
+    });
+    let answer = server
+        .query(rmcp::handler::server::wrapper::Parameters(
+            serde_json::from_value(args).expect("arguments"),
+        ))
+        .await;
+    let err = match answer {
+        Err(e) => e,
+        Ok(_) => panic!("the same write must be refused here too"),
+    };
+    let from_mcp = err.data.expect("a denial carries its code");
+
+    assert_eq!(
+        from_cli["code"], from_mcp["code"],
+        "the same connection refused the same statement differently depending on who asked"
+    );
+    assert_eq!(from_mcp["code"], "policy.read_only");
+}
+
+/// `--write` is the other key, and it is only a key where a human already turned the
+/// first one.
+#[tokio::test]
+async fn a_write_needs_the_flag_even_where_the_connection_allows_it() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "INSERT INTO orders (id, email, total) VALUES (42, 'x@y.example', 1.0)",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 6, "{}", stderr(&out));
+    assert!(stderr(&out).contains("policy.write_not_opted_in"));
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "INSERT INTO orders (id, email, total) VALUES (42, 'x@y.example', 1.0)",
+        "--write",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // And the log says who turned the key, in the column §5 already has for it.
+    let out = w.quokka(&[
+        "audit",
+        "query",
+        // Both attempts are in the log; only the authorized one names an approver, and
+        // that difference is the assertion.
+        "SELECT approved_by, count(*) AS n FROM audit_log \
+         WHERE statement_kind = 'insert' AND event_kind = 'query_started' \
+         GROUP BY approved_by ORDER BY approved_by",
+        "--format",
+        "json",
+    ]);
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    let rows = envelope["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one denied attempt and one authorized: {envelope}"
+    );
+    assert!(
+        rows[0]["approved_by"].is_null(),
+        "a denial authorizes nothing: {envelope}"
+    );
+    assert!(
+        rows[1]["approved_by"].is_string(),
+        "an authorized write records who authorized it: {envelope}"
+    );
+}
+
+#[tokio::test]
+async fn a_stacked_body_is_refused_from_the_cli() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT 1; DROP TABLE orders",
+        "--write",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 6, "{}", stderr(&out));
+    assert!(stderr(&out).contains("policy.multiple_statements"));
+
+    // The table is still there, which is the thing the rule is about.
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT count(*) AS n FROM orders",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+/// A denial is logged under the connection's own `sql_logging`, so a `fingerprint`
+/// connection's literals are absent from the log's bytes even when the query was refused.
+#[tokio::test]
+async fn a_denied_statement_leaves_no_literal_in_a_fingerprint_connection_s_log() {
+    const NEEDLE: &str = "zzq-marker-3f8c-do-not-log";
+
+    let w = Workspace::new().await;
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app-ro",
+        &format!("DELETE FROM orders WHERE email = '{NEEDLE}'"),
+        "--write",
+    ]);
+    assert_eq!(code(&out), 6, "{}", stderr(&out));
+
+    let dump = w.audit_dump();
+    assert!(
+        !dump.contains(NEEDLE),
+        "the denial stored a literal the connection's sql_logging forbids"
+    );
+    assert!(
+        dump.contains("DELETE FROM orders WHERE email = ?"),
+        "the shape must survive, or the denial is unreadable: {dump}"
+    );
+}
+
+#[tokio::test]
+async fn explain_shows_a_plan_and_leaves_a_query_pair() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&[
+        "explain",
+        "--connection",
+        "app",
+        "SELECT * FROM orders WHERE id = 1",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert!(
+        !envelope["plan"].as_str().expect("plan").is_empty(),
+        "{envelope}"
+    );
+
+    let out = w.quokka(&[
+        "audit",
+        "query",
+        "SELECT count(*) AS n FROM audit_log WHERE statement_kind = 'explain'",
+        "--format",
+        "json",
+    ]);
+    let envelope: Json = serde_json::from_str(&stdout(&out)).expect("valid JSON");
+    assert_eq!(envelope["rows"][0]["n"], 2, "a query pair, not one event");
+}
+
+/// Explaining a write needs the same access as running one — the decision
+/// `quokka_core::explain` writes down, asserted from the surface a person meets it on.
+#[tokio::test]
+async fn explaining_a_write_on_a_read_only_connection_is_denied() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&[
+        "explain",
+        "--connection",
+        "app-ro",
+        "DELETE FROM orders",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 6, "{}", stderr(&out));
+    assert!(stderr(&out).contains("policy.read_only"));
+}
+
+#[tokio::test]
+async fn a_timeout_that_could_never_be_met_is_rejected_as_usage() {
+    let w = Workspace::new().await;
+
+    let out = w.quokka(&["query", "--connection", "app", "SELECT 1", "--timeout", "0"]);
+    assert_eq!(code(&out), 2, "a bad flag is a usage error");
+
+    // And a good one is simply accepted.
+    let out = w.quokka(&[
+        "query",
+        "--connection",
+        "app",
+        "SELECT 1",
+        "--timeout",
+        "30s",
+        "--format",
+        "json",
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+/// Invariant 7 at the command line: there is no flag that changes a connection's mode,
+/// its logging fidelity or its caps. The only way is the config file.
+#[tokio::test]
+async fn no_flag_changes_what_only_a_human_may_change() {
+    let w = Workspace::new().await;
+    let help = stdout(&w.quokka(&["query", "--help"]));
+
+    for forbidden in ["--mode", "--sql-logging", "--read-write", "--allow-write "] {
+        assert!(
+            !help.contains(forbidden),
+            "`quokka query` offers {forbidden}, which would let a caller widen its own \
+             guardrail: {help}"
+        );
+    }
+}
+
+/// `quokka mcp` exists, says what posture it is in, and is read-only unless a human
+/// says otherwise.
+#[tokio::test]
+async fn the_mcp_subcommand_is_read_only_unless_a_human_says_otherwise() {
+    let w = Workspace::new().await;
+    let help = stdout(&w.quokka(&["mcp", "--help"]));
+    assert!(help.contains("--allow-writes"), "{help}");
+
+    let top = stdout(&w.quokka(&["--help"]));
+    assert!(top.contains("mcp"), "{top}");
 }

@@ -316,10 +316,39 @@ impl Driver for MySqlDriver {
         Ok(())
     }
 
-    async fn explain(&self, _permit: &ExecutePermit, _sql: &str) -> Result<Plan, DriverError> {
-        Err(DriverError::Unsupported(
-            "EXPLAIN arrives with the policy engine at M3".to_string(),
-        ))
+    /// A plain `EXPLAIN`, rendered from the row MySQL returns.
+    ///
+    /// Not `EXPLAIN ANALYZE` (which executes the statement) and not `FORMAT=TREE` (which
+    /// MariaDB does not have): the plain form is the one both servers in the
+    /// compatibility matrix answer. MySQL returns a table rather than lines of text, so
+    /// the columns are laid out as `name: value` per row, which reads about as well as
+    /// the `\G` output people are used to.
+    async fn explain(&self, _permit: &ExecutePermit, sql: &str) -> Result<Plan, DriverError> {
+        let rows = sqlx::query(AssertSqlSafe(format!("EXPLAIN {sql}")))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(execute_error)?;
+
+        let mut lines = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            if rows.len() > 1 {
+                lines.push(format!("-- row {}", i + 1));
+            }
+            for (ordinal, column) in row.columns().iter().enumerate() {
+                // Every column read as text, because invariant 10 applies here too: an
+                // `EXPLAIN` column this build has never seen must render, not fail.
+                let value = match value_at(row, ordinal) {
+                    Value::Null => "NULL".to_string(),
+                    other => other.to_string(),
+                };
+                lines.push(format!("{}: {}", column.name(), value));
+            }
+        }
+
+        Ok(Plan {
+            dialect: quokka_core::Dialect::MySql,
+            text: lines.join("\n"),
+        })
     }
 }
 

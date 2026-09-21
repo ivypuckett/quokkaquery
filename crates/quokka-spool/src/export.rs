@@ -132,7 +132,7 @@ impl Destination {
         }
     }
 
-    fn open(&self) -> Result<Box<dyn Write>, SpoolError> {
+    fn open(&self) -> Result<Box<dyn Write + Send>, SpoolError> {
         match self {
             Destination::Path(path) => {
                 if let Some(dir) = path.parent() {
@@ -360,7 +360,7 @@ impl RowSink for ExportSink {
 /// CSV, TSV, JSON and NDJSON over one output stream.
 struct TextWriter {
     format: Format,
-    out: Option<Box<dyn Write>>,
+    out: Option<Box<dyn Write + Send>>,
     columns: Vec<Column>,
     /// JSON only: whether an element has been written, so commas land between rows and
     /// not before the first.
@@ -369,7 +369,7 @@ struct TextWriter {
 }
 
 impl TextWriter {
-    fn new(format: Format, out: Box<dyn Write>) -> Self {
+    fn new(format: Format, out: Box<dyn Write + Send>) -> Self {
         TextWriter {
             format,
             out: Some(out),
