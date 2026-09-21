@@ -1,0 +1,61 @@
+[package]
+name = "quokka-ui"
+description = "QuokkaQuery's human UI: an iced window over the one execute path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+quokka-core.workspace = true
+# The spool is how the grid, the pager and the export all read a result (§4). The UI
+# never opens a database: it opens a SQLite file `execute()` filled.
+quokka-spool.workspace = true
+
+# `default-features = false` and then every feature named, because the default set
+# carries `thread-pool` — a second futures executor we must not get. `tokio` is not a
+# preference here: `quokka-core`, `sqlx` and every driver need a tokio reactor in scope,
+# so an iced `Task` running anywhere else would fail the moment it touched a database.
+# See the note on the executor in `work.rs`.
+#
+# `wgpu` and `tiny-skia` are both on, which is §7's rendering decision: wgpu by default
+# with a software fallback selectable for remote desktops and VMs. iced picks the first
+# that initializes, and `--renderer software` forces the second.
+#
+# `x11` and `wayland` are both on because iced refuses to build on Linux without one,
+# and a binary that only ran under one of the two would be an odd thing to ship.
+#
+# `fira-sans` bundles the font §7 asks for — Mozilla's Fira Sans, SIL OFL 1.1 — inside
+# iced itself. The monospace half of the family is vendored in `assets/` for the same
+# reason; see `fonts.rs`.
+iced = { version = "0.14", default-features = false, features = [
+    "tokio",
+    "wgpu",
+    "tiny-skia",
+    "x11",
+    "wayland",
+    "highlighter",
+    "lazy",
+    "fira-sans",
+    "crisp",
+    "web-colors",
+    "linux-theme-detection",
+] }
+# The grid's column resize (§7). iced 0.14 ships a `table` widget of its own, but it
+# takes fixed column widths and has no divider to drag; this crate is that divider, plus
+# the header/body scroll sync it needs. MIT, ~1k lines, pinned to iced 0.14.
+iced_table = "0.14"
+
+serde_json.workspace = true
+time.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+
+[dev-dependencies]
+quokka-audit.workspace = true
+quokka-driver = { workspace = true, features = ["sqlite"] }
+sqlx = { workspace = true, features = ["sqlite"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
