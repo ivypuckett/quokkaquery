@@ -25,10 +25,13 @@ Being narrow about this is a feature of the product, not an apology for it.
   prefetch. Paging reads a local cache of rows you already paid for, never the database.
   Queries cost money; you decide when to spend it.
 
-## Status: M3 — safe for agents
+## Status: M4 — the human UI
 
 What works today:
 
+- **`quokka ui`**: a native window over the same engine — connection tree, SQL editor
+  with highlighting and identifier completion, a 512-row grid, and the audit log as a
+  tab that is itself an ordinary query
 - `quokka query --connection <name> "SELECT …" --format json|ndjson|table --max-rows N`,
   with `--param` for bound values, `--write` for a write and `--timeout 30s`
 - **The policy engine**: every statement classified before it runs, connections read-only
@@ -47,7 +50,7 @@ What works today:
 - The audit log: SQLite in WAL mode, append-only triggers, a hash chain, and the built-in
   `@audit` connection with a `queries` view
 
-The iced UI arrives at M4 and Athena at M5. See `docs/ARCHITECTURE.md` §10.
+Athena and the cost guard arrive at M5, installers at M6. See `docs/ARCHITECTURE.md` §10.
 
 ## Safe for agents
 
@@ -168,6 +171,56 @@ connection explain a `DELETE` — but the relaxation would rest on a per-engine 
 whether `EXPLAIN` executes, inherited silently by every driver added later, and this
 project does not make claims it has not tested. `EXPLAIN ANALYZE`, which does execute, is
 not reachable at all: the prefix is written by the driver, never taken from the caller.
+
+## The window
+
+```console
+$ quokka ui
+$ quokka ui --renderer software     # remote desktops and VMs
+```
+
+Connection tree on the left, SQL editor top right, result grid bottom right. It is a
+*view* over `quokka-core`: there is no path from a click to a database that the CLI and
+the MCP server do not also take, and the compiler is what says so — the permit
+`quokka-core::execute()` issues cannot be constructed anywhere else.
+
+**The mode is in two places and never in a menu.** Every connection in the tree carries
+`read-only` or `read-write`, and so does the strip above the editor. A write refused on a
+read-only connection fails inline, in the engine's own words, naming the setting and
+where to change it — the same sentence `quokka query` and the MCP server produce, because
+it is the same sentence. Switching a connection to `read_write` is ordinary configuration
+in a file a human edits; there is no button for it, and no `--allow-writes` on `quokka
+ui`. A posture flag makes sense for `quokka mcp`, where a human holds a key the agent
+cannot turn. At a window the person who would type it is the person already sitting there,
+so it would be a speed bump rather than a guardrail.
+
+**Writes confirm before they run.** On a `read_write` connection, DML and DDL put up a
+dialog naming the statement kind and the target table, and an `UPDATE` or `DELETE` with
+no `WHERE` says so specifically. The dialog is not the guardrail — `execute()` is — so
+declining does not make a statement safe and confirming does not make it allowed.
+
+**Nothing refreshes itself.** Clicking a table does not preview its rows, selecting a tab
+does not re-run it, and autocomplete reads a catalog already in memory rather than asking
+the database which columns exist. A result tab shows how old its rows are —
+`rows 1–512 of 12,481 · as of 10:00 (45m ago)` — flags itself past `[spool] stale_after`,
+and offers `[Re-run]`. It never takes one.
+
+**Paging, sorting and filtering are reads of the spool**, so turning a page costs nothing
+and changes nothing in the log. When the spool holds a prefix of the result, the sort
+controls say so: the top of the first million is not the top of twelve million, and an
+answer that looks authoritative and is wrong is worse than one that refuses.
+
+Also there: column resize, copy-as-TSV for a selected rectangle, a cell inspector for
+long text, JSON and BLOBs, and streamed export to CSV, TSV, JSON, NDJSON or Parquet —
+audited, like every export.
+
+Rendering is `wgpu` with an automatic `tiny-skia` fallback; `--renderer software` picks
+the fallback outright, which is what you want over a remote desktop. Fira Sans and Fira
+Mono are bundled (SIL OFL 1.1), so a grid lines up the same way on every platform.
+
+Accessibility is the honest gap: iced's screen-reader support is well behind a browser's.
+The window is keyboard-driven where it can be — Ctrl/Cmd+Enter runs — and the CLI remains
+fully featured for anyone the window does not serve.
 
 ## The result spool
 
@@ -356,8 +409,9 @@ allow_schemas = ["analytics"] # statements may only name these...
 allow_tables  = ["public.orders", "public.customers"]   # ...or these
 
 [spool]
-max_rows  = 1000000           # 1M rows / 1 GiB by default; both bound local disk
-max_bytes = "1GiB"            # "512MB", "1GiB", or a plain byte count
+max_rows    = 1000000         # 1M rows / 1 GiB by default; both bound local disk
+max_bytes   = "1GiB"          # "512MB", "1GiB", or a plain byte count
+stale_after = "30m"           # a result tab flags itself past this; "0" never does
 ```
 
 An allowlisted connection admits queries, DML and `EXPLAIN` — the statement kinds whose
@@ -382,19 +436,30 @@ fidelity of its own audit trail defeats the point of the log.
 ## Building
 
 Needs a C compiler on every platform, because `sqlx-sqlite` builds bundled SQLite through
-`libsqlite3-sys`. That is still the only one: Parquet export pulls `arrow`/`parquet`
-(Apache-2.0) and the pure-Rust `snap` codec (BSD-3-Clause), none of which is a `-sys`
-crate, and the compression codecs that would link C — `zstd`, `lz4` — stay switched off.
-Nothing in the tree is GPL. `cargo test` runs everywhere and needs no Docker.
+`libsqlite3-sys`. That is still the only *build* dependency: Parquet export pulls
+`arrow`/`parquet` (Apache-2.0) and the pure-Rust `snap` codec (BSD-3-Clause), none of
+which is a `-sys` crate; the compression codecs that would link C — `zstd`, `lz4` — stay
+switched off; and the window's stack is loaded at runtime rather than linked, so building
+it needs no system package at all. Nothing in the tree is GPL. `cargo test` runs
+everywhere and needs no Docker.
+
+**To run the window on Linux** you need the libraries winit opens at runtime:
+`libxkbcommon-x11` plus X11 or Wayland client libraries — `libxkbcommon-x11-0` on
+Debian/Ubuntu, `libxkbcommon-x11` on Fedora and Arch. Missing them is a panic at startup
+rather than a build failure, because nothing links them. macOS and Windows need nothing
+extra.
 
 ```console
 $ cargo build
 $ cargo test
 ```
 
-Parquet is a default-on feature of `quokka-spool`, and the CLI asks for it by name — so
-`cargo install quokkaquery --no-default-features`, which exists to drop the GUI stack for
-a container or an agent's box, still writes Parquet. A library consumer that only needs
+The window is a default-on `ui` feature of the CLI, so `cargo install quokkaquery
+--no-default-features` yields a headless build with no `wgpu`, `winit` or `iced` anywhere
+in the tree — which is what you want in a container, in CI, or on an agent's box. That
+build keeps every driver and still writes Parquet: Parquet is a default-on feature of
+`quokka-spool` that the CLI asks for by name, because a container is exactly where
+writing Parquet is most useful. A library consumer that only needs
 CSV can drop ~60 crates with `quokka-spool = { …, default-features = false }`.
 
 The container-backed tests for Postgres and MySQL are behind a feature, so they only run
@@ -418,8 +483,9 @@ $ git config core.hooksPath .githooks
 ```
 
 CI is the authority — it runs fmt, clippy and the tests on Linux, macOS and Windows,
-checks that `--no-default-features` pulls no GUI dependencies, and pins the declared
-`rust-version`. The full release matrix arrives with `cargo-dist` at M6.
+checks that `--no-default-features` pulls no GUI dependencies *and* that the default
+build still carries them, opens the window under Xvfb with the software renderer to prove
+it runs a query, and pins the declared `rust-version`. The full release matrix arrives with `cargo-dist` at M6.
 
 `docs/ARCHITECTURE.md` is the source of truth for every decision here, and `CLAUDE.md`
 lists the invariants that must not be eroded.

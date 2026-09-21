@@ -160,9 +160,8 @@ jobs:
         run: cargo build --workspace --no-default-features
 
       # CLAUDE.md: `--no-default-features` must always yield a working headless CLI with
-      # no wgpu/winit in the tree. Trivially true until `quokka-ui` arrives at M4, which
-      # is exactly why the guard belongs here before it does — the commit that breaks
-      # this is the one that adds the UI without gating it.
+      # no wgpu/winit in the tree. This was trivially true until M4; it is the guard that
+      # commit existed to meet, and from here on it is load-bearing.
       # Note the here-strings. Piping into `grep -q` looks equivalent and is not: a
       # match makes grep exit immediately, `echo` takes SIGPIPE, and `pipefail` then
       # reports the whole pipeline as failed. For this check that means the guard fails
@@ -183,10 +182,43 @@ jobs:
       - name: the headless binary runs
         run: cargo run --package quokkaquery --no-default-features -- --version
 
+      # `quokka ui` still parses in a headless build, so asking for it gets an
+      # explanation rather than "unrecognized subcommand". The subcommand is the
+      # discoverable place to say which build you have.
+      - name: the headless build explains that it has no window
+        run: |
+          set -euo pipefail
+          if cargo run --quiet --package quokkaquery --no-default-features -- ui \
+              2>"$RUNNER_TEMP/ui.err"; then
+            echo "::error::a headless build opened a window"
+            exit 1
+          fi
+          if ! grep -q -- "--no-default-features" "$RUNNER_TEMP/ui.err"; then
+            echo "::error::the refusal should say which build this is:"
+            cat "$RUNNER_TEMP/ui.err"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/ui.err"
+
       # Parquet export is default-on and asked for by name in the CLI's manifest, so
       # dropping the CLI's default features must NOT drop it: `--no-default-features`
       # exists to shed the GUI stack for a container, and a container is where writing
       # Parquet is most useful. This is the guard on that decision.
+      # The other half of a default-on feature: a guard that only checks the *absence* of
+      # the GUI lets the feature quietly switch off and still pass. `cargo install
+      # quokkaquery` is supposed to get a window, so the default tree has to carry one.
+      - name: the default build carries the window
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --package quokkaquery --edges normal)
+          for crate in iced iced_table wgpu winit; do
+            if ! grep -Eq "\b${crate} v[0-9]" <<<"$tree"; then
+              echo "::error::the default build lost $crate; did the ui feature stop being default?"
+              exit 1
+            fi
+          done
+          echo "the default tree carries the window"
+
       - name: the headless build still writes parquet
         run: |
           set -euo pipefail
@@ -225,6 +257,117 @@ jobs:
             fi
           done
           echo "headless tree carries sqlite, postgres and mysql"
+
+  window:
+    name: the window opens and runs a query
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # ARCHITECTURE §9 says the UI's test story is smoke tests, because the logic lives
+      # in `quokka-core` and `quokka-spool` where it can be tested properly. This is that
+      # smoke test, and it is the one claim the unit tests cannot make: that the window
+      # actually opens, that a query typed into it runs, and that it lands in the log as
+      # a `ui` query. Everything else about the UI is asserted in `quokka-ui/tests`,
+      # which never opens a window.
+      #
+      # Xvfb with the software renderer, because a GitHub runner has no GPU — which also
+      # exercises §7's `tiny-skia` fallback on every run rather than only on the machines
+      # that need it. `libxkbcommon-x11-0` is a *runtime* dependency winit dlopens; the
+      # build needs no system package at all, which is why nothing above installs one.
+      - name: a virtual display, and what winit loads at runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             xvfb xdotool x11-apps libxkbcommon-x11-0
+
+      - name: cargo build
+        run: cargo build --package quokkaquery
+
+      - name: open it, type a query, and look in the log
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          python3 - "$work" <<'PY'
+          import sqlite3, sys
+          db = sys.argv[1] + "/app.db"
+          c = sqlite3.connect(db)
+          c.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, total REAL)")
+          c.executemany("INSERT INTO orders VALUES (?, ?)", [(i, i * 1.5) for i in range(1, 1201)])
+          c.commit()
+          c.close()
+          PY
+          cat > "$work/config.toml" <<EOF
+          [connections.app]
+          driver = "sqlite"
+          path = "$work/app.db"
+          credential = "none"
+          EOF
+
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1400x900x24 >"$work/xvfb.log" 2>&1 &
+          sleep 2
+
+          export QUOKKA_CONFIG="$work/config.toml"
+          export QUOKKA_AUDIT_DB="$work/audit.db"
+          export QUOKKA_CACHE_DIR="$work/cache"
+          ./target/debug/quokka ui --renderer software >"$work/ui.log" 2>&1 &
+          ui=$!
+
+          # The window, not a timer: a slow runner should wait, not fail.
+          window=""
+          for _ in $(seq 1 90); do
+            window="$(xdotool search --name QuokkaQuery | head -1 || true)"
+            if [ -n "$window" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$window" ]; then
+            echo "::error::no window appeared"
+            cat "$work/ui.log"
+            exit 1
+          fi
+          echo "window: $(xdotool getwindowname "$window")"
+
+          # The window is at 0,0 with no window manager, and it is 1280x820, so this
+          # lands in the editor. Typed through XTEST so winit sees real key events.
+          xdotool windowfocus --sync "$window"
+          sleep 2
+          xdotool mousemove 700 150
+          xdotool click 1
+          sleep 2
+          xdotool type --delay 60 "SELECT * FROM orders"
+          sleep 1
+          xdotool key ctrl+Return
+
+          # Poll the log rather than sleeping a guess.
+          found=""
+          for _ in $(seq 1 60); do
+            if ./target/debug/quokka audit tail -n 20 --format json 2>/dev/null                 | python3 -c "
+          import json, sys
+          page = json.load(sys.stdin)
+          rows = page['rows']
+          ok = [r for r in rows
+                if r['client'] == 'ui' and r['event_kind'] == 'query_finished'
+                and r['status'] == 'ok' and r['rows_returned'] == 1200]
+          sys.exit(0 if ok else 1)
+          "; then
+              found=yes
+              break
+            fi
+            sleep 1
+          done
+
+          kill "$ui" 2>/dev/null || true
+          sleep 2
+          kill -9 "$ui" 2>/dev/null || true
+
+          if [ -z "$found" ]; then
+            echo "::error::the window opened but the query never reached the log"
+            ./target/debug/quokka audit tail -n 20 || true
+            cat "$work/ui.log"
+            exit 1
+          fi
+          echo "the window opened, ran a query, and the log says so"
 
   msrv:
     name: builds on the declared rust-version
