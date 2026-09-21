@@ -19,6 +19,7 @@ mod credential;
 mod format;
 mod schema;
 mod spool;
+mod ui;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -139,6 +140,21 @@ enum Command {
     Audit(AuditCommand),
     /// Serve the Model Context Protocol over stdio, for an agent client (§6.2).
     Mcp(McpArgs),
+    /// Open the window (§7).
+    ///
+    /// The same engine the CLI and the MCP server use: the same connections, the same
+    /// audit log, the same guardrails. A connection that is read-only here is read-only
+    /// there — there is no per-surface exemption, and therefore no flag that would be
+    /// one (invariant 9).
+    Ui(UiArgs),
+}
+
+#[derive(Debug, Args)]
+struct UiArgs {
+    /// Which renderer to use: `gpu` (wgpu, with an automatic software fallback) or
+    /// `software` (tiny-skia), for a remote desktop or a VM.
+    #[arg(long, value_enum, default_value = "gpu")]
+    renderer: ui::RendererArg,
 }
 
 #[derive(Debug, Args)]
@@ -495,17 +511,55 @@ struct VerifyArgs {
     format: Format,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Not `#[tokio::main]`, and that is `quokka ui`'s doing.
+///
+/// iced builds its own multi-thread tokio runtime — that is what `quokka-ui` asking for
+/// iced's `tokio` feature means, and it is not optional: `sqlx` and every driver need a
+/// tokio reactor in scope, so an iced `Task` running on anything else would fail the
+/// first time it touched a database. A runtime inside a runtime is a panic, so the
+/// window is dispatched *before* this program has one, and every other subcommand gets
+/// the runtime built below.
+fn main() -> ExitCode {
     let cli = Cli::parse();
     let json_errors = matches!(error_format(&cli), Format::Json | Format::Ndjson);
 
-    match run(cli).await {
+    let result = match &cli.command {
+        Command::Ui(args) => start_window(&cli, args.renderer),
+        _ => match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(run(cli)),
+            Err(e) => Err(anyhow::Error::new(e).context("starting the async runtime")),
+        },
+    };
+
+    match result {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             report_error(&e, json_errors);
             ExitCode::from(classify(&e))
         }
+    }
+}
+
+/// Open the window, on this thread and outside any runtime of ours.
+fn start_window(cli: &Cli, renderer: ui::RendererArg) -> Result<u8> {
+    let actor = resolve_actor(cli.actor.clone(), cli.actor_kind);
+    ui::run(
+        cli.config.clone(),
+        audit_path(cli.audit_db.clone())?,
+        actor,
+        renderer,
+    )
+}
+
+/// `--audit-db`, else `$QUOKKA_AUDIT_DB`, else the XDG data dir.
+fn audit_path(given: Option<PathBuf>) -> Result<PathBuf> {
+    match given {
+        Some(p) => Ok(p),
+        None => quokka_audit::default_audit_path()
+            .context("locating the audit log; set --audit-db or $QUOKKA_AUDIT_DB"),
     }
 }
 
@@ -527,15 +581,13 @@ fn error_format(cli: &Cli) -> Format {
         Command::Audit(AuditCommand::Verify(a)) => a.format,
         // Nothing this subcommand prints goes to stdout at all — that is the transport.
         Command::Mcp(_) => Format::Table,
+        // And nothing this one prints is output either: it is a window.
+        Command::Ui(_) => Format::Table,
     }
 }
 
 async fn run(cli: Cli) -> Result<u8> {
-    let audit_path = match &cli.audit_db {
-        Some(p) => p.clone(),
-        None => quokka_audit::default_audit_path()
-            .context("locating the audit log; set --audit-db or $QUOKKA_AUDIT_DB")?,
-    };
+    let audit_path = audit_path(cli.audit_db.clone())?;
 
     let audit = AuditLog::open(&audit_path)
         .await
@@ -747,6 +799,8 @@ async fn run(cli: Cli) -> Result<u8> {
             result?;
             exit::OK
         }
+        // Dispatched in `main`, before this runtime existed. See `start_window`.
+        Command::Ui(_) => unreachable!("the window is started before the runtime is built"),
     };
 
     // The clean exit of §4.1: the spool directory goes, so nothing of this result
