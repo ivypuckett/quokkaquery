@@ -22,10 +22,10 @@ pub mod value;
 
 pub use catalog::CatalogCache;
 pub use config::{
-    default_config_path, default_port, dialect_hint, AccessMode, Allowlist, Config,
-    ConnectionConfig, Limits, Registry, SpoolConfig, TlsMode, AUDIT_CONNECTION,
-    DEFAULT_CATALOG_TTL, DEFAULT_CONNECT_TIMEOUT, DEFAULT_SPOOL_MAX_BYTES, DEFAULT_SPOOL_MAX_ROWS,
-    DEFAULT_SPOOL_STALE_AFTER,
+    default_config_path, default_port, dialect_hint, AccessMode, Allowlist, AthenaConfig, Config,
+    ConnectionConfig, CostGuard, Limits, Registry, SpoolConfig, TlsMode, AUDIT_CONNECTION,
+    DEFAULT_ATHENA_CATALOG, DEFAULT_CATALOG_TTL, DEFAULT_CONNECT_TIMEOUT, DEFAULT_SPOOL_MAX_BYTES,
+    DEFAULT_SPOOL_MAX_ROWS, DEFAULT_SPOOL_STALE_AFTER,
 };
 pub use confirm::WriteConfirmation;
 pub use credential::{Backend as CredentialBackend, CredentialError, CredentialRef};
@@ -45,6 +45,12 @@ pub use sql::{summarize, SqlSummary, TableRef};
 // The policy engine's own vocabulary, so a surface rendering a denial does not have to
 // depend on `quokka-policy` directly — and, more to the point, cannot be tempted to call
 // it instead of going through `execute()`.
+/// `50000000000` → `50 GB`, in the spelling `[cost_guard]` uses (§6.4).
+///
+/// Lives in `quokka-policy` because that is where the cost budget's own messages are
+/// written, and is re-exported here so the pager's line and a budget denial agree on how
+/// a size reads — one formatter, three surfaces.
+pub use quokka_policy::cost_bytes;
 pub use quokka_policy::Denial;
 pub use value::{Column, Dialect, Row, Value};
 

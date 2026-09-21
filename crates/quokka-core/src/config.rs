@@ -92,7 +92,39 @@ impl TlsMode {
 /// Whether a connection may be written to, and the guardrails that ride with it, live
 /// in `quokka-policy` — the crate `execute()` consults before it issues a permit — and
 /// are re-exported here so `quokka_core::AccessMode` still resolves.
-pub use quokka_policy::{AccessMode, Allowlist, Limits};
+pub use quokka_policy::{AccessMode, Allowlist, CostGuard, Limits};
+
+/// What an Athena connection needs that the wire-protocol drivers do not (§3.2).
+///
+/// Its own struct rather than five more `Option`s on [`ConnectionConfig`], because they
+/// travel together: a connection either is an Athena connection or has none of them, and
+/// [`check`] refuses a `workgroup` on a Postgres connection for exactly that reason.
+///
+/// Note what is *not* here: a credential. Athena authenticates through the AWS SDK's own
+/// chain — an `sso_session` profile in `~/.aws/config` and the token cache `aws sso
+/// login` writes — so there is no secret for QuokkaQuery to store. See
+/// [`CredentialRef::for_driver`](crate::CredentialRef::for_driver).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AthenaConfig {
+    /// The AWS region, e.g. `eu-west-1`. Required: a region-less Athena client fails at
+    /// the first call with an SDK error rather than a message about the config file.
+    pub region: String,
+    /// The named profile in `~/.aws/config` whose credentials to use. `None` leaves the
+    /// SDK's default chain — `AWS_PROFILE`, environment credentials, an instance role.
+    pub profile: Option<String>,
+    /// The workgroup to run in. **Part of the cost story rather than a detail**: §6.4's
+    /// layer 1 is the workgroup's `BytesScannedCutoffPerQuery`, which is the only
+    /// control that can stop a single query mid-flight.
+    pub workgroup: String,
+    /// `s3://bucket/prefix/` for query results. Optional, because a workgroup may
+    /// enforce its own output location — and when neither does, Athena says so.
+    pub output_location: Option<String>,
+    /// The data catalog. `AwsDataCatalog` unless a federated catalog is named.
+    pub catalog: String,
+}
+
+/// The data catalog an Athena connection uses when the config file does not say.
+pub const DEFAULT_ATHENA_CATALOG: &str = "AwsDataCatalog";
 
 /// One configured connection.
 ///
@@ -135,6 +167,14 @@ pub struct ConnectionConfig {
     pub catalog_ttl: Duration,
     /// How long to keep trying to connect before reporting a failure.
     pub connect_timeout: Duration,
+    /// Athena's own settings (§3.2). `Some` exactly for `driver = "athena"`.
+    pub athena: Option<AthenaConfig>,
+    /// The cumulative cost budget for this connection (§6.4, layer 2).
+    ///
+    /// `None` — the default — means no budget, and therefore no read of the audit log
+    /// before a query runs. Human-only like everything else here (invariant 7): there
+    /// is no flag, and no agent-callable tool, that sets or raises one.
+    pub cost_guard: Option<CostGuard>,
     /// True for `@audit`, which the registry supplies rather than the config file.
     pub builtin: bool,
 }
@@ -166,6 +206,8 @@ impl ConnectionConfig {
             schema: None,
             catalog_ttl: DEFAULT_CATALOG_TTL,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            athena: None,
+            cost_guard: None,
             builtin: false,
         }
     }
@@ -189,6 +231,15 @@ impl ConnectionConfig {
     pub fn target(&self) -> String {
         if let Some(path) = &self.path {
             return path.display().to_string();
+        }
+        if let Some(athena) = &self.athena {
+            // What a person needs to recognize the connection, in the order they think
+            // about it. No credential appears here because there is none to appear.
+            let profile = match &athena.profile {
+                Some(p) => format!("{p}@"),
+                None => String::new(),
+            };
+            return format!("{profile}{}/{}", athena.region, athena.workgroup);
         }
         let Some(host) = &self.host else {
             return self.name.clone();
@@ -307,6 +358,52 @@ struct ConnectionFile {
     /// `"10s"` by default.
     #[serde(default)]
     connect_timeout: Option<String>,
+
+    // Athena (§3.2). `deny_unknown_fields` on this struct is what makes a typo here a
+    // message about the config file rather than an AWS error twenty seconds later —
+    // and `check()` below is what makes `workgroup` on a Postgres connection one too.
+    /// Athena: the AWS region, e.g. `"eu-west-1"`.
+    #[serde(default)]
+    region: Option<String>,
+    /// Athena: the named profile in `~/.aws/config`. Ordinary configuration rather than
+    /// a credential — see `CredentialRef::for_driver`.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Athena: the workgroup to run in, and where §6.4's layer 1 lives.
+    #[serde(default)]
+    workgroup: Option<String>,
+    /// Athena: `"s3://bucket/prefix/"`. Optional when the workgroup enforces one.
+    #[serde(default)]
+    output_location: Option<String>,
+    /// Athena: the data catalog; `"AwsDataCatalog"` unless a federated one is named.
+    #[serde(default)]
+    catalog: Option<String>,
+
+    /// `[connections.<name>.cost_guard]` (§6.4). Absent means no budget.
+    #[serde(default)]
+    cost_guard: Option<CostGuardFile>,
+}
+
+/// `[connections.x.cost_guard]` as §6.4 spells it.
+///
+/// Four keys, and the asymmetry between two of them is the point rather than an
+/// oversight to tidy away: a person running an expensive query is awake and watching,
+/// an agent looping at 3am is the invoice. So agents get a limit and humans get a
+/// warning, and there is no `agent_warn` because a warning is a sentence somebody reads.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CostGuardFile {
+    /// The rolling window: `"1d"`, `"12h"`. Defaults to a day.
+    #[serde(default)]
+    window: Option<String>,
+    /// `"50GB"`, or `"unlimited"` for no cap.
+    #[serde(default)]
+    agent_limit: Option<String>,
+    #[serde(default)]
+    human_limit: Option<String>,
+    /// Where a human is warned rather than stopped.
+    #[serde(default)]
+    human_warn: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -491,7 +588,10 @@ impl Registry {
 
             let credential = match &c.credential {
                 Some(text) => CredentialRef::parse(text, &name).map_err(|e| bad(e.to_string()))?,
-                None => CredentialRef::default_for(&name),
+                // Driver-aware, for one driver: Athena has no password to keep
+                // anywhere, so its default is `none` rather than a keyring entry that
+                // would never hold anything.
+                None => CredentialRef::for_driver(&c.driver, &name),
             };
             let catalog_ttl = match &c.catalog_ttl {
                 Some(text) => parse_duration(text).ok_or_else(|| {
@@ -531,6 +631,12 @@ impl Registry {
             let allow =
                 Allowlist::new(c.allow_schemas.clone(), c.allow_tables.clone()).map_err(bad)?;
 
+            let athena = athena_config(&c).map_err(&bad)?;
+            let cost_guard = match &c.cost_guard {
+                Some(file) => Some(cost_guard(file).map_err(&bad)?),
+                None => None,
+            };
+
             let cfg = ConnectionConfig {
                 name: name.clone(),
                 driver: c.driver,
@@ -551,6 +657,8 @@ impl Registry {
                 schema: c.schema,
                 catalog_ttl,
                 connect_timeout,
+                athena,
+                cost_guard,
                 builtin: false,
             };
             if let Err(detail) = check(&cfg) {
@@ -617,8 +725,141 @@ fn audit_connection(audit_db: &Path) -> ConnectionConfig {
         schema: None,
         catalog_ttl: DEFAULT_CATALOG_TTL,
         connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        athena: None,
+        // No budget on the log itself. Reading your own audit trail is the cheapest
+        // query in the program and scans nothing, and a budget here would be a way for
+        // a busy connection to stop you reviewing it.
+        cost_guard: None,
         builtin: true,
     }
+}
+
+/// Assemble an Athena connection's settings, or refuse an Athena setting on a
+/// connection that is not one.
+///
+/// The second half is the part that earns its keep. `deny_unknown_fields` catches
+/// `workgrp = "…"`; only this catches `workgroup = "…"` on a Postgres connection, which
+/// parses perfectly and means nothing — the setting the user believed in would simply
+/// never be read.
+fn athena_config(c: &ConnectionFile) -> Result<Option<AthenaConfig>, String> {
+    let elsewhere = [
+        ("region", c.region.is_some()),
+        ("profile", c.profile.is_some()),
+        ("workgroup", c.workgroup.is_some()),
+        ("output_location", c.output_location.is_some()),
+        ("catalog", c.catalog.is_some()),
+    ];
+
+    if c.driver != "athena" {
+        if let Some((key, _)) = elsewhere.iter().find(|(_, set)| *set) {
+            return Err(format!(
+                "`{key}` is an athena setting and this connection is `driver = \
+                 \"{}\"`, so nothing would ever read it",
+                c.driver
+            ));
+        }
+        return Ok(None);
+    }
+
+    let region = c.region.clone().ok_or_else(|| {
+        "an athena connection needs a `region` (e.g. region = \"eu-west-1\"); without \
+         one the AWS SDK fails at the first call rather than here"
+            .to_string()
+    })?;
+    let workgroup = c.workgroup.clone().ok_or_else(|| {
+        "an athena connection needs a `workgroup`. Name it explicitly even if it is \
+         \"primary\": a workgroup carrying `BytesScannedCutoffPerQuery` is the only \
+         control that can stop a single runaway query mid-flight (§6.4), so which one \
+         you are in is not a detail to inherit silently"
+            .to_string()
+    })?;
+
+    if let Some(location) = &c.output_location {
+        if !location.starts_with("s3://") {
+            return Err(format!(
+                "output_location {location:?} is not an S3 URI; write it as \
+                 \"s3://bucket/prefix/\""
+            ));
+        }
+    }
+
+    Ok(Some(AthenaConfig {
+        region,
+        profile: c.profile.clone(),
+        workgroup,
+        output_location: c.output_location.clone(),
+        catalog: c
+            .catalog
+            .clone()
+            .unwrap_or_else(|| DEFAULT_ATHENA_CATALOG.to_string()),
+    }))
+}
+
+/// Read `[connections.x.cost_guard]` (§6.4).
+fn cost_guard(file: &CostGuardFile) -> Result<CostGuard, String> {
+    let defaults = CostGuard::default();
+
+    let window = match &file.window {
+        Some(text) => {
+            let window = parse_duration(text).ok_or_else(|| {
+                format!(
+                    "cost_guard window {text:?} is not a duration; write it as \"1d\", \
+                     \"12h\" or \"30m\""
+                )
+            })?;
+            if window.is_zero() {
+                return Err(
+                    "cost_guard window = \"0\" would sum nothing at all; remove \
+                            the whole [cost_guard] block to have no budget"
+                        .to_string(),
+                );
+            }
+            window
+        }
+        None => defaults.window,
+    };
+
+    // A limit is a size, `"unlimited"`, or absent. The last two differ: absent takes
+    // §6.4's proposed default for that actor kind, and `"unlimited"` says the person
+    // looked at the default and does not want it. Silently treating a missing key as
+    // unlimited would hand an agent an uncapped budget by omission.
+    let limit = |key: &str, text: &Option<String>, fallback: Option<u64>| match text {
+        None => Ok(fallback),
+        Some(text) if is_unlimited(text) => Ok(None),
+        Some(text) => parse_bytes(text).map(Some).ok_or_else(|| {
+            format!(
+                "cost_guard {key} {text:?} is not a size; write it as \"50GB\", \
+                 \"500GB\", a plain number of bytes, or \"unlimited\""
+            )
+        }),
+    };
+
+    let guard = CostGuard {
+        window,
+        agent_limit: limit("agent_limit", &file.agent_limit, defaults.agent_limit)?,
+        human_limit: limit("human_limit", &file.human_limit, defaults.human_limit)?,
+        human_warn: limit("human_warn", &file.human_warn, defaults.human_warn)?,
+    };
+
+    // A warning threshold above the limit never fires: the denial arrives first. Said
+    // here rather than left to be noticed, because the failure mode is a person
+    // believing they will be warned.
+    if let (Some(warn), Some(limit)) = (guard.human_warn, guard.human_limit) {
+        if warn >= limit {
+            return Err(format!(
+                "cost_guard human_warn ({warn} bytes) is not below human_limit ({limit} \
+                 bytes), so the warning could never appear — the query would be denied \
+                 first"
+            ));
+        }
+    }
+
+    Ok(guard)
+}
+
+fn is_unlimited(text: &str) -> bool {
+    let t = text.trim();
+    t.eq_ignore_ascii_case("unlimited") || t.eq_ignore_ascii_case("none")
 }
 
 /// What a connection must have for its driver to stand a chance.
@@ -650,6 +891,35 @@ fn check(cfg: &ConnectionConfig) -> Result<(), String> {
                     cfg.driver
                 ));
             }
+        }
+        "athena" => {
+            if cfg.path.is_some() || cfg.host.is_some() || cfg.port.is_some() {
+                return Err(
+                    "an athena connection has no `path`, `host` or `port`; it has a \
+                     `region`, a `workgroup` and an `output_location`"
+                        .to_string(),
+                );
+            }
+            if cfg.user.is_some() {
+                return Err(
+                    "an athena connection has no `user`; it authenticates through an AWS \
+                     profile — set `profile = \"…\"` and sign in with `aws sso login`"
+                        .to_string(),
+                );
+            }
+            if !matches!(cfg.credential, CredentialRef::None) {
+                return Err(
+                    "an athena connection stores no credential here, so it needs \
+                     `credential = \"none\"` (or no `credential` line at all). AWS \
+                     credentials come from the SDK's own chain — an `sso_session` \
+                     profile in ~/.aws/config and the token cache `aws sso login` \
+                     writes — which belongs to the AWS CLI rather than to QuokkaQuery"
+                        .to_string(),
+                );
+            }
+            // `region` and `workgroup` are checked while the config is assembled, which
+            // is where the value can be turned into the message.
+            debug_assert!(cfg.athena.is_some());
         }
         // An unknown driver is the engine's error to report, with the list of what this
         // build includes. Guessing at its required fields here would be worse.
@@ -799,6 +1069,214 @@ mod tests {
         let config = write(dir.path(), "[spool]\nstale_after = \"soon\"\n");
         let err = Config::load(Some(&config), &audit_db).expect_err("not a duration");
         assert!(err.to_string().contains("stale_after"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Athena (§3.2) and the cost guard (§6.4)
+    // -----------------------------------------------------------------------
+
+    const ATHENA: &str = "[connections.lake]\n\
+                          driver = \"athena\"\n\
+                          region = \"eu-west-1\"\n\
+                          workgroup = \"quokka\"\n\
+                          output_location = \"s3://bucket/results/\"\n\
+                          profile = \"analytics\"\n\
+                          database = \"analytics\"\n";
+
+    #[test]
+    fn an_athena_connection_reads_its_four_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(dir.path(), ATHENA);
+        let registry = Registry::load(Some(&config), &dir.path().join("audit.db")).expect("load");
+
+        let lake = registry.get("lake").expect("lake");
+        let athena = lake.athena.as_ref().expect("athena settings");
+        assert_eq!(athena.region, "eu-west-1");
+        assert_eq!(athena.workgroup, "quokka");
+        assert_eq!(
+            athena.output_location.as_deref(),
+            Some("s3://bucket/results/")
+        );
+        assert_eq!(athena.profile.as_deref(), Some("analytics"));
+        assert_eq!(athena.catalog, DEFAULT_ATHENA_CATALOG);
+        assert_eq!(lake.dialect(), Dialect::Athena);
+        // The AWS profile is ordinary configuration; the SSO token cache belongs to the
+        // AWS CLI, so there is no credential for QuokkaQuery to keep.
+        assert_eq!(lake.credential, CredentialRef::None);
+        // And it stays read-only by default like every other connection (invariant 9).
+        assert_eq!(lake.mode, AccessMode::ReadOnly);
+    }
+
+    /// The point of teaching `check()` about `athena`: a typo is a message about the
+    /// config file rather than an AWS error twenty seconds later.
+    #[test]
+    fn an_athena_connection_missing_a_required_setting_says_which() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit_db = dir.path().join("audit.db");
+
+        let cases = [
+            (
+                "[connections.lake]\ndriver = \"athena\"\nworkgroup = \"quokka\"\n",
+                "region",
+            ),
+            (
+                "[connections.lake]\ndriver = \"athena\"\nregion = \"eu-west-1\"\n",
+                "workgroup",
+            ),
+            (
+                "[connections.lake]\ndriver = \"athena\"\nregion = \"eu-west-1\"\n\
+                 workgroup = \"q\"\nhost = \"athena.example.com\"\n",
+                "host",
+            ),
+            (
+                "[connections.lake]\ndriver = \"athena\"\nregion = \"eu-west-1\"\n\
+                 workgroup = \"q\"\nuser = \"reader\"\n",
+                "user",
+            ),
+            (
+                "[connections.lake]\ndriver = \"athena\"\nregion = \"eu-west-1\"\n\
+                 workgroup = \"q\"\noutput_location = \"/tmp/results\"\n",
+                "s3://",
+            ),
+            (
+                "[connections.lake]\ndriver = \"athena\"\nregion = \"eu-west-1\"\n\
+                 workgroup = \"q\"\ncredential = \"keyring\"\n",
+                "credential",
+            ),
+        ];
+
+        for (toml, needle) in cases {
+            let config = write(dir.path(), toml);
+            let err = Registry::load(Some(&config), &audit_db)
+                .expect_err("this config should be refused");
+            assert!(
+                err.to_string().contains(needle),
+                "the message should name {needle:?}: {err}"
+            );
+        }
+    }
+
+    /// The other half, and the one only `check()` can catch: a setting that parses
+    /// perfectly and would never be read.
+    #[test]
+    fn an_athena_setting_on_another_driver_is_refused_rather_than_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "[connections.prod]\ndriver = \"postgres\"\nhost = \"db\"\n\
+             workgroup = \"quokka\"\n",
+        );
+        let err = Registry::load(Some(&config), &dir.path().join("audit.db"))
+            .expect_err("a workgroup on Postgres means nothing");
+        assert!(err.to_string().contains("workgroup"), "{err}");
+        assert!(err.to_string().contains("postgres"), "{err}");
+    }
+
+    /// A misspelled key is caught by `deny_unknown_fields`, which is why the struct has
+    /// it — the same protection every other connection setting already had.
+    #[test]
+    fn a_misspelled_athena_key_is_a_message_about_the_config_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "[connections.lake]\ndriver = \"athena\"\nregion = \"eu-west-1\"\n\
+             work_group = \"quokka\"\n",
+        );
+        let err = Registry::load(Some(&config), &dir.path().join("audit.db"))
+            .expect_err("work_group is not a key");
+        assert!(err.to_string().contains("work_group"), "{err}");
+    }
+
+    #[test]
+    fn a_cost_guard_reads_as_section_6_4_spells_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "[connections.prod]\ndriver = \"sqlite\"\npath = \"/tmp/a.db\"\n\
+             \n\
+             [connections.prod.cost_guard]\n\
+             window       = \"1d\"\n\
+             agent_limit  = \"50GB\"\n\
+             human_limit  = \"unlimited\"\n\
+             human_warn   = \"500GB\"\n",
+        );
+        let registry = Registry::load(Some(&config), &dir.path().join("audit.db")).expect("load");
+        let guard = registry
+            .get("prod")
+            .expect("prod")
+            .cost_guard
+            .expect("a cost guard");
+
+        assert_eq!(guard.window, Duration::from_secs(86_400));
+        assert_eq!(guard.agent_limit, Some(50_000_000_000));
+        assert_eq!(
+            guard.human_limit, None,
+            "\"unlimited\" means no cap, which is §6.4's proposed default for a human"
+        );
+        assert_eq!(guard.human_warn, Some(500_000_000_000));
+    }
+
+    /// A connection with no `[cost_guard]` has no budget, which is the default and the
+    /// case where nothing is read from the log before a query.
+    #[test]
+    fn no_cost_guard_block_means_no_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "[connections.prod]\ndriver = \"sqlite\"\npath = \"/tmp/a.db\"\n",
+        );
+        let registry = Registry::load(Some(&config), &dir.path().join("audit.db")).expect("load");
+        assert_eq!(registry.get("prod").expect("prod").cost_guard, None);
+    }
+
+    /// An omitted key takes §6.4's proposed default rather than silently becoming
+    /// unlimited: an agent uncapped by omission is the failure this block exists to
+    /// prevent.
+    #[test]
+    fn an_omitted_limit_takes_the_proposed_default_not_unlimited() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write(
+            dir.path(),
+            "[connections.prod]\ndriver = \"sqlite\"\npath = \"/tmp/a.db\"\n\
+             \n[connections.prod.cost_guard]\nwindow = \"12h\"\n",
+        );
+        let registry = Registry::load(Some(&config), &dir.path().join("audit.db")).expect("load");
+        let guard = registry
+            .get("prod")
+            .expect("prod")
+            .cost_guard
+            .expect("a cost guard");
+        assert_eq!(guard.window, Duration::from_secs(12 * 3600));
+        assert_eq!(guard.agent_limit, CostGuard::default().agent_limit);
+        assert!(guard.agent_limit.is_some(), "an agent is capped by default");
+    }
+
+    #[test]
+    fn a_nonsensical_cost_guard_is_refused_with_a_reason() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let audit_db = dir.path().join("audit.db");
+        let base = "[connections.prod]\ndriver = \"sqlite\"\npath = \"/tmp/a.db\"\n\
+                    \n[connections.prod.cost_guard]\n";
+
+        for (extra, needle) in [
+            ("agent_limit = \"fifty gigabytes\"\n", "agent_limit"),
+            ("window = \"soon\"\n", "window"),
+            ("window = \"0\"\n", "window"),
+            // A warning above the limit could never appear; a person who set it would
+            // believe in a warning they will never get.
+            (
+                "human_limit = \"100GB\"\nhuman_warn = \"200GB\"\n",
+                "human_warn",
+            ),
+            ("agent_warn = \"1GB\"\n", "agent_warn"),
+        ] {
+            let config = write(dir.path(), &format!("{base}{extra}"));
+            let err = Registry::load(Some(&config), &audit_db).expect_err("should be refused");
+            assert!(
+                err.to_string().contains(needle),
+                "the message should name {needle:?}: {err}"
+            );
+        }
     }
 
     #[test]
