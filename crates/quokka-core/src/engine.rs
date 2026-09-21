@@ -536,6 +536,42 @@ pub async fn execute(
     Ok(outcome)
 }
 
+/// [`execute()`], driven on a thread the runtime has been told is blocked.
+///
+/// **Why this exists at all.** [`RowSink`] is synchronous by design — `execute()` drives
+/// the row stream itself and hands rows over one at a time — and the sink every
+/// long-lived surface uses is the spool, which runs its SQLite connection on a thread of
+/// its own and *blocks its caller* while a batch lands. That is harmless in a CLI, whose
+/// whole job is this one query. It is not harmless behind an MCP request handler, where
+/// a blocked worker is every other tool call waiting, and it is not harmless behind a
+/// window, where it is every other task the UI has in flight.
+///
+/// `block_in_place` is the honest fix: it tells tokio that this worker is about to
+/// block, so the runtime moves the other tasks off it, and `block_on` drives this
+/// query's own I/O here. The alternative — making `RowSink` async — would push the seam
+/// into `execute()` and into every surface for the sake of the callers that spool.
+///
+/// **On a current-thread runtime there is nothing to move work to**, so `block_in_place`
+/// would panic and buy nothing; awaiting normally is then exactly the CLI's behaviour,
+/// where the blocking was already fine. Both surfaces that need this run on a
+/// multi-thread runtime: `quokka mcp` builds one, and `quokka ui` gets one from iced,
+/// whose `tokio` feature makes its executor a `tokio::runtime::Runtime` — which is
+/// multi-thread — and which runs every `Task` future as an ordinary tokio task on it.
+pub async fn execute_blocking(
+    engine: &Engine,
+    request: ExecuteRequest,
+    sink: &mut dyn RowSink,
+) -> Result<Outcome, CoreError> {
+    let future = execute(engine, request, sink);
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(move || handle.block_on(future))
+        }
+        _ => future.await,
+    }
+}
+
 /// One request for a statement's execution plan.
 #[derive(Debug, Clone)]
 pub struct ExplainRequest {
