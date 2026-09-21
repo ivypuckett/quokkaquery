@@ -653,6 +653,78 @@ The mechanism is generic — a per-actor budget over an audited metric — so it
 row or query counts on other drivers. It is Athena-first because Athena is where a query
 costs money.
 
+### 6.5 What M5 settled, which this section left open
+
+Four questions only turn up once the budget is real, and each is recorded here for the
+same reason §6.3's three and §7.1's four are: the answer is not recoverable from the
+code later.
+
+1. **The spend is gathered by the caller and passed in as a value.** §6.4 says "a budget
+   check is a query against `@audit`", which is true of where the number lives and must
+   not become true of who reads it. `quokka-policy` is a library of pure functions over
+   SQL and a dialect (§9's corpus depends on that, and so does CLAUDE.md's first testing
+   priority), so a `Policy` that opened the audit database would put I/O *below*
+   `execute()` in the dependency graph. `quokka-core` gathers the spend — it already
+   holds the log — and `Policy::decide` stays a pure function of budget, spend and who
+   is asking.
+
+   And the read is **not itself an audited query.** Routing it through `execute()` on
+   `@audit` would append two events per check, and *that* query would need a budget
+   check of its own, appending two more. The standing it takes instead is the one
+   `quokka export --query-id` already claimed and `quokka audit verify` has always had:
+   this program consulting its own record, as a structured lookup over fixed columns
+   with every value bound, rather than SQL somebody asked to run. Invariant 1 is about
+   reaching a database *on a caller's behalf*; `quokka-audit` reading the file it owns
+   and writes is not that. A query a person writes against the log still goes through
+   `@audit` and is logged like any other.
+
+2. **A spend that cannot be read fails closed.** Invariant 6 fails closed when the log
+   cannot be *written*; this is the other half and it is a separate decision, so it is
+   stated rather than left to fall out of a `?`. A budget that assumed nothing had been
+   spent would be a budget anything able to break the log could remove — and the actor
+   this guard exists for is precisely the one with shell access. The cost is one clear
+   error (`policy.cost_unknown`) on a connection whose owner asked for a budget;
+   connections with no `cost_guard` are untouched, because nothing is read for them.
+
+3. **The budget binds a (connection, actor) pair.** §6.4's TOML puts the block under a
+   connection and the limits under actor kinds, which is a shape rather than an answer
+   to "one agent, three connections". The answer is that the block is a *connection's*
+   configuration, written by the human who configured that connection: summing an
+   agent's spend across connections would let one connection's budget be exhausted by
+   traffic its owner never authorized and cannot see. So three connections with a 50 GB
+   agent cap are three 50 GB caps, and an agent working across all three can scan 150 GB
+   in a day. Within a connection it is per actor *id* — two agents do not share a budget,
+   which is what makes "which agent burned it" answerable — and the *kind* only chooses
+   which limit applies. A single global budget is not expressible in this shape, and
+   saying so is better than a cap people believe in and do not have.
+
+4. **`cost_estimate_usd` is never computed.** The column stays in the schema and in
+   `row_hash`'s field list, and stays NULL. Filling it needs a price per byte, and
+   Athena's is a region-dependent list price Amazon changes: a rate compiled into the
+   binary would be wrong for some readers the day it shipped and wrong for everyone
+   eventually, and it would be wrong *silently*, sitting uncorrectable in an append-only
+   table beside an exact measurement. A stale number that cannot be edited is worse than
+   a NULL beside an exact `data_scanned_bytes`. The arithmetic belongs to whoever reads
+   the log, at the rate that applies to them, at the moment they ask — which is how §5's
+   own example query already does it. Nothing in the cost guard needs it either: §6.4's
+   budget is denominated in bytes. A configured per-connection rate is a later decision
+   this one does not foreclose.
+
+Two smaller things M5 fixed in passing, recorded because both are load-bearing:
+
+- **An Athena connection's AWS profile is an ordinary connection field, not a
+  `CredentialRef` variant.** The credential module is about secrets QuokkaQuery *stores*;
+  an SSO token cache is written and refreshed by the AWS CLI, expires on a schedule we
+  do not set, and would be the one keyring entry `quokka credential set` could not fill.
+  So `profile = "…"` is configuration and `credential = "none"` is the only value an
+  Athena connection accepts.
+- **A driver reports what it measured through `QueryStream::meta`, including when the
+  query failed.** `Result::Err` has nowhere to put a number, so an Athena execution that
+  failed or was cancelled comes back as a stream whose first item is the error, carrying
+  the statistics with it. A query that scanned three terabytes and then failed on a
+  missing column cost what a successful one would have, and a budget that only saw
+  successes would be blind to an agent's worst hour.
+
 ---
 
 ## 7. Human UI (iced)
@@ -831,6 +903,13 @@ and Azure Data Studio do not, and it should be real before any pixels are pushed
 | Explaining a write on a read-only connection | **Denied** | The relaxation would rest on a per-engine claim about whether `EXPLAIN` executes, inherited by every driver added later (§3.0) |
 | The MCP server's connection registry | **Shared with the CLI; every connection visible** | A connection an agent cannot see is one it cannot reach, so hiding would be a second weaker guardrail competing with the mode. Visibility is documentation (§6.2) |
 | Writes over MCP | **Read-only unless launched `--allow-writes`** | A surface may narrow a connection's mode and never widen one, so an agent's `write: true` is confined to what two human decisions already allowed |
+| Where the budget's spend is read | **By `quokka-core`, passed to the policy engine as a value** | `quokka-policy` is pure functions over SQL; a policy engine that opened a database would put I/O below `execute()` and end the corpus tests (§6.5) |
+| The budget check's own events | **None — a structured lookup, not an audited query** | Through `execute()` it would append two events per check, and that query would need a budget check appending two more. Same standing as `quokka audit verify` (§6.5) |
+| A spend that cannot be read | **Fail closed** | A budget that assumed zero would be removable by whatever broke the log, and the threat model is an agent with shell access (§6.5) |
+| What a budget binds | **One connection, one actor id; the kind picks the limit** | The block is a connection's own configuration; summing across connections would spend a budget its owner never authorized. A global budget is not expressible (§6.5) |
+| `cost_estimate_usd` | **Never computed; stays NULL** | The rate is a region-dependent list price that changes. A wrong number in an append-only table beside an exact byte count cannot be corrected (§6.5) |
+| An Athena connection's AWS profile | **An ordinary connection field, `credential = "none"`** | The credential module is about secrets we store; an SSO token cache belongs to the AWS CLI (§6.5) |
+| Bound parameters on Athena | **Refused** | `ExecutionParameters` substitute text, so the caller quotes its own literals — literal substitution rather than binding, and a driver that quoted for you would be guessing (§3.2) |
 
 The single-user decision is load-bearing in more places than it looks: it removes the
 shared Postgres sink, accounts, and any notion of non-repudiation between people, and it

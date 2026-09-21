@@ -25,7 +25,7 @@ Being narrow about this is a feature of the product, not an apology for it.
   prefetch. Paging reads a local cache of rows you already paid for, never the database.
   Queries cost money; you decide when to spend it.
 
-## Status: M4 — the human UI
+## Status: M5 — Athena, and the cost guard
 
 What works today:
 
@@ -46,11 +46,19 @@ What works today:
 - `quokka connections list` and `quokka schema describe <table>`
 - `quokka credential set | delete | status`
 - `quokka audit tail | query | verify`
-- **SQLite, PostgreSQL and MySQL**
+- **SQLite, PostgreSQL, MySQL and Amazon Athena** — Athena over `aws-sdk-athena` with
+  SSO credentials from your `~/.aws/config` profile and the token cache `aws sso login`
+  writes. Read the compatibility matrix below before you rely on it.
+- **What a query cost, recorded and shown.** `data_scanned_bytes` reaches the audit log
+  from the driver that reported it, and the number appears in the CLI's envelope and
+  footer, in the MCP response, and above the grid in the window.
+- **The cost guard** (§6.4): a workgroup's `BytesScannedCutoffPerQuery` for the single
+  runaway query, and a cumulative per-actor budget for the drift — with separate caps
+  for agents and humans, because the failure modes differ.
 - The audit log: SQLite in WAL mode, append-only triggers, a hash chain, and the built-in
   `@audit` connection with a `queries` view
 
-Athena and the cost guard arrive at M5, installers at M6. See `docs/ARCHITECTURE.md` §10.
+Installers and the docs site arrive at M6. See `docs/ARCHITECTURE.md` §10.
 
 ## Safe for agents
 
@@ -290,6 +298,28 @@ not the top of twelve million — so every page and every export says so in as m
 | `sqlite` | sqlx 0.9 over bundled SQLite (`libsqlite3-sys`, a C library) | in-memory and on-disk, every platform CI builds |
 | `postgres` | sqlx 0.9, pure Rust wire protocol, `rustls` | PostgreSQL 16 |
 | `mysql` | sqlx 0.9, pure Rust wire protocol, `rustls` | MySQL 8.4 |
+| `athena` | hand-written over `aws-sdk-athena` 1.x, `rustls` | **no server — recorded HTTP fixtures only** |
+
+**Read that last row as it is written.** The Postgres and MySQL rows mean a real server
+of that version, in a container, on every pull request. The Athena row does not mean
+that, and the difference is the whole reason this table exists. There is no Athena to
+run in CI — LocalStack's Athena support is not in its community edition — so the driver
+is tested against recorded `StartQueryExecution` / `GetQueryExecution` /
+`GetQueryResults` / `StopQueryExecution` responses replayed over a local listener.
+
+What that proves: the driver submits the workgroup and output location it was
+configured with, polls with capped backoff, types columns from `ResultSetMetadata`,
+degrades an unrecognized type to text rather than aborting the result set, really calls
+`StopQueryExecution` on a cancel, and carries `DataScannedInBytes` into the audit log.
+
+What it cannot prove: that those recordings match what Athena actually sends. A fixture
+is a claim about the API written down by the same person who wrote the code reading it,
+and no fixture has ever caught a misunderstanding shared by both. **No real Athena
+workgroup has been queried by this code.** Until one has, treat the Athena driver as
+untested against the thing it targets, and expect the first contact with a real
+workgroup to find something. A live test against a real workgroup exists as a manual
+step rather than a CI job, for the same reason the container tests are a separate job:
+it needs credentials CI does not have.
 
 `libmysqlclient` is never linked: it is GPLv2 and this project is MIT.
 
@@ -314,6 +344,111 @@ composite or any OID this build has never heard of comes back as the string the 
 would have printed, rather than aborting the result set. Exact numerics (`numeric`,
 `decimal`) stay text deliberately, because they are exact and an `f64` is not.
 
+### Amazon Athena, and what a query costs
+
+Athena is not a wire protocol, so the driver is hand-written over `aws-sdk-athena`:
+`StartQueryExecution` in the configured workgroup, `GetQueryExecution` polled with
+capped exponential backoff, `GetQueryResults` paged with columns typed from
+`ResultSetMetadata`, and `StopQueryExecution` on a cancel.
+
+**Credentials come from the AWS CLI, not from us.** A connection names a `profile` in
+`~/.aws/config`, and `aws-config` resolves it — including an `sso_session` profile and
+the token cache `aws sso login` writes, with refresh. There is no keyring entry and no
+`quokka credential set` for an Athena connection, because there is no secret
+QuokkaQuery holds: an SSO token cache is refreshed by a tool we do not run and expires
+on a schedule we do not set. When it has expired you get a sentence, not a protocol
+error:
+
+```console
+$ quokka query --connection lake "SELECT count(*) FROM events"
+error: the AWS SSO session for profile "analytics" has expired.
+       Run `aws sso login --profile analytics` and try again.
+```
+
+**Cancel means something stronger here.** Elsewhere the Stop button stops *reading* and
+the server may still be finishing; on Athena the driver breaks its polling loop and
+calls `StopQueryExecution`, which stops the scan — and a scan that has stopped has
+stopped costing money.
+
+**Bound parameters are refused, deliberately.** Athena's `ExecutionParameters` substitute
+values as *text*, so you would have to quote string literals yourself and we would be
+guessing at everything else. That is literal substitution wearing binding's clothes, so
+the driver says so instead. Write the value into the statement; the log records it at
+that connection's `sql_logging` either way.
+
+**What a query scanned is recorded and shown** — in the log's `data_scanned_bytes`, in
+`--format json`, in the table footer, in the MCP response, and above the grid:
+
+```console
+$ quokka query --connection lake "SELECT count(*) AS n FROM events" --format json
+{"query_id":"018f…","status":"ok",…,"data_scanned_bytes":3221225472,"data_scanned":"3.2 GB"}
+```
+
+`cost_estimate_usd` stays NULL, and that is a decision rather than an omission. The rate
+is a region-dependent list price Amazon changes; a number computed at write time would
+be wrong for some readers immediately and for everyone eventually, and it would sit
+uncorrectable in an append-only table beside an exact byte count. The bytes are the
+measurement, and the arithmetic belongs to whoever reads the log at the rate that
+applies to them:
+
+```console
+$ quokka audit query "SELECT actor_id, sum(data_scanned_bytes)/1e12 * 5 AS usd
+                        FROM audit_log WHERE event_kind = 'query_finished'
+                          AND at > date('now','-7 days')
+                        GROUP BY 1 ORDER BY 3 DESC"
+```
+
+### The cost guard
+
+Athena bills by data scanned, so a runaway query is a bill rather than an error. Two
+layers, because neither is sufficient alone.
+
+**Layer 1 — the workgroup, and it is the only one that can stop a running query.**
+Athena workgroups support `BytesScannedCutoffPerQuery`, which aborts a single query
+mid-flight. Set one. That is why `workgroup` is a required setting that QuokkaQuery
+makes you name even when it is `primary`: running in whichever workgroup the account
+defaults to is running without the only control that can stop a catastrophe in progress.
+
+**Layer 2 — a cumulative per-actor budget, ours.** A rolling window, checked before
+execution, enforced by denying:
+
+```console
+$ quokka --actor claude query --connection lake "SELECT * FROM events"
+error: refusing this query: connection "lake" caps agents at 50 GB of data scanned per
+       1d, and 62 GB has already been scanned. …
+```
+
+That refusal is a denial like any other: exit code `6`, `policy.cost_budget` in the
+envelope, and two events in the log with `status = 'denied'` on the second.
+
+**Separate caps for agents and humans**, which is the point rather than a default to
+tidy away. A person running an expensive query is awake, watching it, and will notice
+the bill; an agent looping on a bad query at 3am is the scenario that generates a
+surprise invoice. So agents get a limit and humans get a warning — there is no
+`agent_warn`, because a warning is a sentence somebody reads.
+
+**What layer 2 cannot do, stated plainly.** Athena reports bytes scanned *after*
+execution and there is no reliable pre-execution estimate, so this budget stops the
+query **after** the one that crossed the line, never the one that crossed it. A single
+query can exhaust a day's budget and be charged in full. Layer 1 bounds one query;
+layer 2 bounds the drift. Anything that called itself a hard cost cap would be lying.
+
+Two more things worth knowing about the shape:
+
+- **The budget binds a (connection, actor) pair.** The block is a connection's
+  configuration, so three connections with a 50 GB agent cap are three 50 GB caps, and
+  an agent working across all three can scan 150 GB in a day. Summing across connections
+  would let one connection's budget be exhausted by traffic its owner never authorized.
+  A single global budget is not something this shape can express.
+- **If the spend cannot be read, the query is refused.** Not run. A budget that fell
+  back to "assume nothing was spent" would be removable by whatever made the log
+  unreadable — and the actor this guard exists for is the one with shell access.
+  Connections with no `cost_guard` are unaffected, because nothing is read for them.
+
+Budgets are human-only configuration, like everything else in the config file. There is
+no flag and no agent-callable tool that raises a limit, lengthens a window, or switches
+a guard off.
+
 ### Credentials
 
 Passwords never go in the config file. A connection names *where* its credential lives,
@@ -334,6 +469,10 @@ XChaCha20-Poly1305 under an Argon2id-derived key. Be clear about that key. With
 Without one, the key sits in a `0600` file beside it and **file permissions are the
 security boundary** — the same boundary `~/.pgpass` and `~/.ssh/id_ed25519` have always
 relied on.
+
+Athena is the exception, and it is one by design: an Athena connection is
+`credential = "none"` and authenticates through the AWS SDK's own chain. This module is
+about secrets QuokkaQuery stores, and an SSO token cache belongs to the AWS CLI.
 
 A resolved credential is a `Secret`: no `Display`, no `Serialize`, a `Debug` that prints
 `***`, and zeroized on drop. That is what keeps a password out of a log line, rather than
@@ -408,6 +547,28 @@ timeout       = "30s"         # cancelled and logged as `timeout` past this
 allow_schemas = ["analytics"] # statements may only name these...
 allow_tables  = ["public.orders", "public.customers"]   # ...or these
 
+# Amazon Athena (§3.2). There is no password here and no keyring entry: an Athena
+# connection authenticates through the AWS SDK's own chain, so `credential` is "none"
+# and the profile is ordinary configuration. Sign in with `aws sso login --profile
+# analytics`; an expired token is a message saying exactly that.
+[connections.lake]
+driver          = "athena"
+region          = "eu-west-1"
+workgroup       = "quokka"              # required, and not a detail — see below
+output_location = "s3://my-bucket/athena-results/"   # optional if the workgroup sets one
+profile         = "analytics"           # a profile in ~/.aws/config; omit for the default chain
+database        = "analytics"           # resolves unqualified table names
+catalog         = "AwsDataCatalog"      # only for a federated catalog
+credential      = "none"
+
+# The cumulative half of the cost guard (§6.4). Optional: a connection with no
+# [cost_guard] block has no budget and reads nothing before a query.
+[connections.lake.cost_guard]
+window       = "1d"           # the rolling window the spend is summed over
+agent_limit  = "50GB"         # past this, an agent's queries are denied
+human_limit  = "unlimited"    # a person running an expensive query is watching it
+human_warn   = "500GB"        # so they get a sentence, not a refusal
+
 [spool]
 max_rows    = 1000000         # 1M rows / 1 GiB by default; both bound local disk
 max_bytes   = "1GiB"          # "512MB", "1GiB", or a plain byte count
@@ -436,7 +597,14 @@ fidelity of its own audit trail defeats the point of the log.
 ## Building
 
 Needs a C compiler on every platform, because `sqlx-sqlite` builds bundled SQLite through
-`libsqlite3-sys`. That is still the only *build* dependency: Parquet export pulls
+`libsqlite3-sys`. **That is still the only *build* dependency, Athena included** — which
+took a deliberate choice rather than luck. Every `aws-sdk-*` crate defaults to
+`rustls-aws-lc`, which pulls `aws-lc-sys`: a C library wanting a C compiler *and* cmake.
+The AWS crates are therefore taken with `default-features = false` and the HTTPS client
+is built by hand over `rustls` with `ring` — the same TLS stack sqlx already puts in the
+tree, with the same native root store. `cargo tree` carries no `aws-lc-sys` and no new
+`-sys` crate of any kind, and CI checks it on every pull request rather than trusting
+this paragraph. The rest: Parquet export pulls
 `arrow`/`parquet` (Apache-2.0) and the pure-Rust `snap` codec (BSD-3-Clause), none of
 which is a `-sys` crate; the compression codecs that would link C — `zstd`, `lz4` — stay
 switched off; and the window's stack is loaded at runtime rather than linked, so building
