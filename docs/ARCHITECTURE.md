@@ -673,6 +673,11 @@ Build dependencies to document:
   most Linux images; Windows needs the MSVC build tools.
 - **Linux additionally needs the `winit` stack** (`libxkbcommon`, Wayland or X11
   development headers) for the UI build.
+- **Nothing further for Parquet export.** `parquet`/`arrow` (Apache-2.0) and the `snap`
+  codec (BSD-3-Clause) are pure Rust with no `-sys` crate among them, so the C compiler
+  above remains the only one. This holds only while the C-linking codecs stay off:
+  `zstd` and `lz4` are the ones that would add a build dependency, and `parquet` is
+  therefore taken with `default-features = false`.
 
 The headless build (`--no-default-features`) drops the `winit` stack but still needs the C
 compiler, which is what makes it the right default for containers and CI.
@@ -750,3 +755,15 @@ re-points the hash chain at its real threat model — an agent editing its own t
 1. **Spool type fidelity.** SQLite's five storage classes versus an Arrow IPC spool (§4.2).
    Deliberately deferred until a real type round-trips badly — the evidence should drive
    this rather than taste.
+
+   *Evidence so far (M2, unchanged decision).* Two of the six `Value` variants do not
+   survive SQLite natively: `Bool`, which has no storage class and reads back as an
+   integer, and `Float(NaN)`, which SQLite stores as NULL. Both are handled by a one-byte
+   tag on the stored blob — about six lines, pinned by a test that asserts SQLite's own
+   behaviour so a bundled-SQLite upgrade cannot change it quietly. Everything else
+   round-trips as it stands, including the case this section was most worried about: an
+   exact `numeric` arriving as text stays text, because the spool's result columns are
+   declared with no type at all and so take BLOB affinity, which converts nothing. The
+   infinities also round-trip as REAL, contrary to what one might assume from the NaN
+   behaviour. This is not enough to move the spool to Arrow. Taking a dependency on
+   `parquet` for *export* does not bear on the question either way.

@@ -67,6 +67,22 @@ struct JsonSink {
     rows: Vec<Json>,
 }
 
+/// Add what the spool did to an envelope or a footer.
+///
+/// `rows_shown` is its own number from M2 onwards, because the preview is a page of the
+/// spool rather than everything the query returned: a result can be 1,000,000 rows
+/// returned, 1,000,000 spooled and 512 on screen, and an envelope that reported one
+/// number for all three would be wrong twice.
+fn spool_fields(envelope: &mut Map<String, Json>, outcome: &Outcome, rows_shown: usize) {
+    envelope.insert("rows_shown".into(), Json::from(rows_shown));
+    if let Some(spooled) = outcome.rows_spooled {
+        envelope.insert("rows_spooled".into(), Json::from(spooled));
+    }
+    if let Some(cap) = outcome.spool_capped {
+        envelope.insert("spool_capped".into(), Json::String(cap.to_string()));
+    }
+}
+
 impl RowSink for JsonSink {
     fn begin(&mut self, columns: &[Column]) -> std::io::Result<()> {
         self.columns = columns.to_vec();
@@ -93,9 +109,11 @@ impl RowSink for JsonSink {
             "columns".into(),
             serde_json::to_value(&self.columns).unwrap_or(Json::Null),
         );
+        let shown = self.rows.len();
         envelope.insert("rows".into(), Json::Array(std::mem::take(&mut self.rows)));
         envelope.insert("row_count".into(), Json::from(outcome.rows_returned));
         envelope.insert("truncated".into(), Json::Bool(outcome.truncated));
+        spool_fields(&mut envelope, outcome, shown);
         envelope.insert("duration_ms".into(), Json::from(outcome.duration_ms));
         if let Some(n) = outcome.rows_affected {
             envelope.insert("rows_affected".into(), Json::from(n));
@@ -118,6 +136,7 @@ impl RowSink for JsonSink {
 #[derive(Default)]
 struct NdjsonSink {
     columns: Vec<Column>,
+    rows_written: usize,
 }
 
 impl RowSink for NdjsonSink {
@@ -130,17 +149,28 @@ impl RowSink for NdjsonSink {
         let mut out = std::io::stdout().lock();
         serde_json::to_writer(&mut out, &row_object(&self.columns, row))?;
         out.write_all(b"\n")?;
+        drop(out);
+        self.rows_written += 1;
         // Flushed per row: this format exists to be read by something downstream while
         // the query is still running.
-        out.flush()
+        std::io::stdout().lock().flush()
     }
 
     fn end(&mut self, outcome: &Outcome) -> std::io::Result<()> {
         std::io::stdout().lock().flush()?;
         // stdout stays a pure stream of rows, so the summary — truncation included —
         // goes to stderr rather than becoming a row-shaped line that is not a row.
+        let mut summary = match outcome_json(outcome) {
+            Json::Object(map) => map,
+            other => {
+                let mut map = Map::new();
+                map.insert("outcome".into(), other);
+                map
+            }
+        };
+        spool_fields(&mut summary, outcome, self.rows_written);
         let mut err = std::io::stderr().lock();
-        serde_json::to_writer(&mut err, &outcome_json(outcome))?;
+        serde_json::to_writer(&mut err, &Json::Object(summary))?;
         err.write_all(b"\n")?;
         err.flush()
     }
@@ -212,7 +242,7 @@ impl RowSink for TableSink {
             }
         }
 
-        writeln!(out, "{}", footer(outcome))?;
+        writeln!(out, "{}", footer(outcome, self.rows.len()))?;
         out.flush()?;
 
         // The JSON formats carry the failure inside the envelope; the table has to say
@@ -225,18 +255,31 @@ impl RowSink for TableSink {
     }
 }
 
-fn footer(outcome: &Outcome) -> String {
-    let mut parts = vec![format!(
-        "{} row{}",
-        outcome.rows_returned,
-        if outcome.rows_returned == 1 { "" } else { "s" }
-    )];
+fn footer(outcome: &Outcome, rows_shown: usize) -> String {
+    let mut parts = vec![if rows_shown as u64 == outcome.rows_returned {
+        format!(
+            "{} row{}",
+            outcome.rows_returned,
+            if outcome.rows_returned == 1 { "" } else { "s" }
+        )
+    } else {
+        // The preview is a page of the spool, so what is on screen and what came back
+        // are two different numbers and both belong here.
+        format!("{rows_shown} of {} rows shown", outcome.rows_returned)
+    }];
     if let Some(affected) = outcome.rows_affected {
         parts.push(format!("{affected} affected"));
     }
-    if outcome.truncated {
-        // Never silent (§4.2): a prefix that looks like the whole answer is the failure
-        // mode this line exists to prevent.
+    // Never silent (§4.2), and never vague about which cap: a prefix that looks like
+    // the whole answer is the failure mode these lines exist to prevent, and a cap
+    // named wrongly sends the reader to the wrong setting.
+    if let Some(cap) = outcome.spool_capped {
+        parts.push(format!(
+            "TRUNCATED at the spool's {cap} cap; {} spooled of {} returned",
+            outcome.rows_spooled.unwrap_or(0),
+            outcome.rows_returned
+        ));
+    } else if outcome.truncated {
         parts.push("TRUNCATED at --max-rows; the result has more".to_string());
     }
     parts.push(format!("{} ms", outcome.duration_ms));

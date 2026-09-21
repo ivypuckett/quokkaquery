@@ -84,9 +84,20 @@ pub struct Outcome {
     pub columns: Vec<Column>,
     pub rows_returned: u64,
     pub rows_affected: Option<i64>,
-    /// True when the cap stopped the read before the result was exhausted. Never silent
-    /// (§4.2): the sink is told, and so is the log.
+    /// True when `max_rows` stopped the read before the result was exhausted. Never
+    /// silent (§4.2): the sink is told, and so is the log.
     pub truncated: bool,
+    /// Rows the sink kept for paging and export, when it is a spool (§4). `None` when
+    /// the sink caches nothing — a formatter writing to stdout has nothing to page.
+    pub rows_spooled: Option<u64>,
+    /// Set when the *spool's* own cap stopped it keeping more (§4.2) — a different
+    /// thing from `truncated`, which is the caller's `max_rows`.
+    ///
+    /// The two stay distinguishable in the log without a new column: at `max_rows`
+    /// every row that came back was kept, so `rows_spooled = rows_returned`; at the
+    /// spool's cap the rows went on reaching the caller while the cache stopped
+    /// growing, so `rows_spooled < rows_returned`.
+    pub spool_capped: Option<Cap>,
     pub duration_ms: i64,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -96,6 +107,43 @@ impl Outcome {
     pub fn is_ok(&self) -> bool {
         matches!(self.status, Status::Ok)
     }
+
+    /// True when what the user can reach is a prefix of what the query returned —
+    /// whichever cap stopped it. This is the question a footer or a pager is asking.
+    pub fn is_partial(&self) -> bool {
+        self.truncated || self.spool_capped.is_some()
+    }
+}
+
+/// Which of a caching sink's own limits stopped it (§4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cap {
+    Rows,
+    Bytes,
+}
+
+impl Cap {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cap::Rows => "rows",
+            Cap::Bytes => "bytes",
+        }
+    }
+}
+
+impl std::fmt::Display for Cap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a caching sink kept, for the `rows_spooled` and `truncated` columns (§5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Retained {
+    pub rows: u64,
+    /// `Some` when the sink's own limit, not the caller's `max_rows`, stopped it.
+    pub capped: Option<Cap>,
 }
 
 /// Where `execute()` puts the rows it reads.
@@ -109,6 +157,16 @@ pub trait RowSink {
     fn row(&mut self, row: &Row) -> std::io::Result<()>;
     /// Called once, whatever the outcome — including after an error or a cancellation.
     fn end(&mut self, outcome: &Outcome) -> std::io::Result<()>;
+
+    /// What this sink kept, if it is a cache the surface will read back.
+    ///
+    /// Asked *before* [`RowSink::end`], because the answer goes into the [`Outcome`]
+    /// that `end` is then handed, and from there into `rows_spooled` and `truncated`
+    /// (§5). The default is `None`: a formatter writing to stdout keeps nothing, and
+    /// `rows_spooled` stays NULL rather than claiming a spool that does not exist.
+    fn retained(&self) -> Option<Retained> {
+        None
+    }
 }
 
 /// A sink that discards rows. Useful for `EXPLAIN`-style callers and for tests that care
@@ -339,6 +397,10 @@ pub async fn execute(
             ),
         };
 
+    // Asked before `end()`, because the answer belongs in the outcome that `end()` is
+    // handed — and in the log below.
+    let retained = sink.retained();
+
     let outcome = Outcome {
         query_id,
         connection: cfg.name.clone(),
@@ -347,6 +409,8 @@ pub async fn execute(
         rows_returned,
         rows_affected,
         truncated,
+        rows_spooled: retained.map(|r| r.rows),
+        spool_capped: retained.and_then(|r| r.capped),
         duration_ms,
         error_code,
         error_message,
@@ -386,9 +450,12 @@ pub async fn execute(
         error_message: outcome.error_message.clone(),
         rows_returned: Some(outcome.rows_returned as i64),
         rows_affected: outcome.rows_affected,
-        // The spool lands at M2; until then nothing is spooled and the column says so.
-        rows_spooled: None,
-        truncated: Some(outcome.truncated),
+        rows_spooled: outcome.rows_spooled.map(|n| n as i64),
+        // Either cap makes what the user can reach a prefix of the result, so either
+        // sets this column — §4.2 is explicit that hitting the spool cap marks the
+        // result truncated. Which cap it was stays readable from the two row counts
+        // beside it (see `Outcome::spool_capped`).
+        truncated: Some(outcome.is_partial()),
         export_format: None,
         export_path: None,
         data_scanned_bytes: None,

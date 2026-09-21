@@ -22,14 +22,18 @@ Being narrow about this is a feature of the product, not an apology for it.
 - **The grid shows one page — 512 rows, a hard ceiling.** The full dataset goes to a file
   through streamed export, never through a bigger grid.
 - **Nothing runs without you asking.** No auto-refresh, no polling, no speculative
-  prefetch. Queries cost money; you decide when to spend it.
+  prefetch. Paging reads a local cache of rows you already paid for, never the database.
+  Queries cost money; you decide when to spend it.
 
-## Status: M1 — the daily-driver CLI
+## Status: M2 — the bounded-view contract
 
 What works today:
 
 - `quokka query --connection <name> "SELECT …" --format json|ndjson|table --max-rows N`,
   with `--param` for bound values
+- **The result spool**: one execution, then paging, sorting and export as reads of a
+  local cache — `--export ./orders.parquet` in the same invocation, `--sort`, and
+  `quokka export --query-id <id> --rerun`
 - `quokka connections list` and `quokka schema describe <table>`
 - `quokka credential set | delete | status`
 - `quokka audit tail | query | verify`
@@ -37,8 +41,69 @@ What works today:
 - The audit log: SQLite in WAL mode, append-only triggers, a hash chain, and the built-in
   `@audit` connection with a `queries` view
 
-The result spool arrives at M2, the policy engine and the MCP server at M3, the iced UI
-at M4, and Athena at M5. See `docs/ARCHITECTURE.md` §10.
+The policy engine and the MCP server arrive at M3, the iced UI at M4, and Athena at M5.
+See `docs/ARCHITECTURE.md` §10.
+
+## The result spool
+
+A query runs **once**. As its rows arrive they are written into a per-result SQLite cache,
+and everything after that — the preview on screen, the next page, a re-sort, the export —
+is a read of that cache:
+
+```console
+$ quokka query --connection prod "SELECT * FROM orders" --export ./orders.parquet
+… 512 rows …
+(512 of 48,120 rows shown · 91 ms · query 018f…)
+exported 48120 rows to ./orders.parquet (parquet, 184122 bytes)
+```
+
+One execution, one bill. Paging never re-runs the query, which matters most where it
+costs money: `LIMIT 512 OFFSET n` against an arbitrary query re-scans per page, and
+without a total ordering page 2 can repeat rows from page 1.
+
+Export streams — CSV, TSV, JSON, NDJSON and Parquet — and is never bounded by what the
+screen can hold. `-` writes to stdout; `--all` streams straight from the driver to the
+file with no cache at all, for a dataset larger than local disk.
+
+**The spool is ephemeral.** It lives in a PID-scoped directory under the XDG *cache*
+directory (`$QUOKKA_CACHE_DIR` overrides it) — not `/tmp`, which is tmpfs on many systems
+and would put a 1 GiB spool in RAM. It is deleted on clean exit, and a crash's leftovers
+are swept at the next startup. A cache that outlived the session would serve rows that no
+longer match the database, which is the one thing a query tool must not do.
+
+So a `quokka` invocation cannot page or export an *earlier* invocation's result — the
+rows died with it. `quokka export --query-id <id>` therefore refuses unless you add
+`--rerun`, and says why:
+
+```console
+$ quokka export --query-id 018f… -o ./orders.csv
+error: refusing to export query 018f… without --rerun.
+
+A spool does not survive the process that made it (§4.1), so the rows from that
+invocation are gone. Producing this file means executing the query again, which costs a
+second scan — on Athena, real money — and QuokkaQuery never spends that implicitly.
+```
+
+`--rerun` needs the connection's `sql_logging` to be `full`. At the default,
+`fingerprint`, the log kept the query's *shape* with literals replaced by `?`, so the text
+needed to run it again was never written down — and reconstructing SQL from a fingerprint
+would run a different query from the one you are citing, so we refuse rather than guess.
+
+**Exports are audited events in their own right**, linked to the query that produced them
+by `parent_id` — including the ones that fail. An export that filled a disk part way
+through is logged with the rows that reached the file, because a log that disagreed with
+what is on disk would be worse than no record at all, and it exits `5` rather than the
+usage code: the query ran, only the file did not. Note that this is the opposite of the rule for a catalog cache hit, and
+deliberately: a cache hit logs nothing because nothing was read, while an export logs
+because "someone wrote ten million rows to a file" is exactly what an audit trail exists
+to catch.
+
+**Truncation is always reported, never silent.** Two caps can stop a result being whole,
+they say so differently, and the log tells them apart: at `--max-rows` every row that came
+back was kept (`rows_spooled = rows_returned`), while at the spool's own cap the rows kept
+coming and the cache stopped growing (`rows_spooled < rows_returned`). Sorting or
+filtering a truncated result orders the *spooled* rows — the top of the first million is
+not the top of twelve million — so every page and every export says so in as many words.
 
 ### Drivers
 
@@ -151,6 +216,10 @@ credential      = "keyring"   # keyring (default) | keyring:<service>/<account>
 tls             = "prefer"    # disable | prefer (default) | require | verify-ca | verify-full
 catalog_ttl     = "60s"       # "0" to cache nothing
 connect_timeout = "10s"
+
+[spool]
+max_rows  = 1000000           # 1M rows / 1 GiB by default; both bound local disk
+max_bytes = "1GiB"            # "512MB", "1GiB", or a plain byte count
 ```
 
 `mode = "read_only"` is enforced by the server, not by us declining to send the write:
@@ -165,12 +234,20 @@ fidelity of its own audit trail defeats the point of the log.
 ## Building
 
 Needs a C compiler on every platform, because `sqlx-sqlite` builds bundled SQLite through
-`libsqlite3-sys`. `cargo test` runs everywhere and needs no Docker.
+`libsqlite3-sys`. That is still the only one: Parquet export pulls `arrow`/`parquet`
+(Apache-2.0) and the pure-Rust `snap` codec (BSD-3-Clause), none of which is a `-sys`
+crate, and the compression codecs that would link C — `zstd`, `lz4` — stay switched off.
+Nothing in the tree is GPL. `cargo test` runs everywhere and needs no Docker.
 
 ```console
 $ cargo build
 $ cargo test
 ```
+
+Parquet is a default-on feature of `quokka-spool`, and the CLI asks for it by name — so
+`cargo install quokkaquery --no-default-features`, which exists to drop the GUI stack for
+a container or an agent's box, still writes Parquet. A library consumer that only needs
+CSV can drop ~60 crates with `quokka-spool = { …, default-features = false }`.
 
 The container-backed tests for Postgres and MySQL are behind a feature, so they only run
 when you ask for them and Docker is there:

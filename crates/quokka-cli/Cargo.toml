@@ -26,6 +26,10 @@ default = []
 quokka-audit.workspace = true
 quokka-core.workspace = true
 quokka-driver = { workspace = true, features = ["sqlite", "postgres", "mysql"] }
+# Parquet asked for by name rather than inherited, so `cargo install quokkaquery
+# --no-default-features` — which exists to drop the GUI stack for a container or an
+# agent's box — still writes Parquet. See quokka-spool's manifest for the rest.
+quokka-spool = { workspace = true, features = ["parquet"] }
 
 anyhow.workspace = true
 clap.workspace = true

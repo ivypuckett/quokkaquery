@@ -26,6 +26,19 @@ pub const AUDIT_CONNECTION: &str = "@audit";
 /// the log, because nothing reached a database (§5).
 pub const DEFAULT_CATALOG_TTL: Duration = Duration::from_secs(60);
 
+/// How many rows a single result may spool before it is truncated (§4.2).
+///
+/// Bounds local disk rather than anything the user can see: the grid's ceiling is 512
+/// and the CLI's preview default is the same, so this number only ever binds an export
+/// or a long page-through. Configurable in either direction — unlike the display cap,
+/// which is configurable downward only — because what it protects is the disk under
+/// the cache directory, and only the person whose disk it is knows how much there is.
+pub const DEFAULT_SPOOL_MAX_ROWS: u64 = 1_000_000;
+
+/// How many bytes of row payload a single result may spool before it is truncated
+/// (§4.2).
+pub const DEFAULT_SPOOL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// How long a connection attempt may keep trying before it is called a failure.
 ///
 /// sqlx's pool retries a refused or unreachable server until its acquire timeout, which
@@ -205,6 +218,38 @@ pub fn default_port(driver: &str) -> Option<u16> {
     }
 }
 
+/// The spool's limits, as `[spool]` in the config file sets them (§4.2).
+///
+/// Human-only, like everything else in this module (invariant 7). There is no flag that
+/// raises them, not because raising them is dangerous but because a spool that grows
+/// past the disk it lives on is a problem for the person at the machine, not for the
+/// agent that asked for the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpoolConfig {
+    pub max_rows: u64,
+    pub max_bytes: u64,
+}
+
+impl Default for SpoolConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_SPOOL_MAX_ROWS,
+            max_bytes: DEFAULT_SPOOL_MAX_BYTES,
+        }
+    }
+}
+
+/// `[spool]` as the TOML file spells it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpoolFile {
+    #[serde(default)]
+    max_rows: Option<u64>,
+    /// `"1GiB"`, `"512MB"`, or a plain byte count.
+    #[serde(default)]
+    max_bytes: Option<String>,
+}
+
 /// A connection as the TOML file spells it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -246,6 +291,106 @@ struct ConnectionFile {
 struct ConfigFile {
     #[serde(default)]
     connections: BTreeMap<String, ConnectionFile>,
+    #[serde(default)]
+    spool: SpoolFile,
+}
+
+/// Everything the config file says: the connections, and the settings that are not
+/// per-connection.
+#[derive(Debug, Clone, Default)]
+pub struct Config {
+    pub registry: Registry,
+    pub spool: SpoolConfig,
+}
+
+impl Config {
+    /// Read the config file once, for both halves of what it holds.
+    pub fn load(config_path: Option<&Path>, audit_db: &Path) -> Result<Self, CoreError> {
+        let path = match config_path {
+            Some(p) => p.to_path_buf(),
+            None => default_config_path()?,
+        };
+
+        let file = read_config_file(&path)?;
+        let spool = spool_config(&path, &file.spool)?;
+        let mut registry = Registry::from_file(&path, file.connections)?;
+        // Registered over the file, so a config that tried to name a connection
+        // `@audit` could not shadow the log. (It cannot try: the loop above refuses
+        // every name starting with '@'.)
+        registry.insert(audit_connection(audit_db));
+
+        Ok(Config { registry, spool })
+    }
+}
+
+fn read_config_file(path: &Path) -> Result<ConfigFile, CoreError> {
+    if !path.exists() {
+        return Ok(ConfigFile::default());
+    }
+    let text = std::fs::read_to_string(path).map_err(|e| CoreError::Config {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+    toml::from_str(&text).map_err(|e| CoreError::Config {
+        path: path.to_path_buf(),
+        detail: e.to_string(),
+    })
+}
+
+fn spool_config(path: &Path, file: &SpoolFile) -> Result<SpoolConfig, CoreError> {
+    let mut spool = SpoolConfig::default();
+    if let Some(rows) = file.max_rows {
+        if rows == 0 {
+            return Err(CoreError::Config {
+                path: path.to_path_buf(),
+                detail: "[spool] max_rows = 0 would spool nothing at all; remove the \
+                         setting to use the default"
+                    .to_string(),
+            });
+        }
+        spool.max_rows = rows;
+    }
+    if let Some(text) = &file.max_bytes {
+        spool.max_bytes = parse_bytes(text).ok_or_else(|| CoreError::Config {
+            path: path.to_path_buf(),
+            detail: format!(
+                "[spool] max_bytes {text:?} is not a size; write it as \"1GiB\", \
+                 \"512MB\" or a plain number of bytes"
+            ),
+        })?;
+    }
+    Ok(spool)
+}
+
+/// `"1GiB"`, `"512MB"`, `"1048576"`. Both the binary and the decimal spellings, because
+/// people write both and guessing which one they meant is worse than accepting each.
+fn parse_bytes(text: &str) -> Option<u64> {
+    let t = text.trim();
+    let (number, unit) = match t.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(i) => (t[..i].trim(), t[i..].trim().to_ascii_lowercase()),
+        None => (t, String::new()),
+    };
+    let n: f64 = number.parse().ok()?;
+    if n < 0.0 {
+        return None;
+    }
+    let scale: f64 = match unit.as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1e3,
+        "kib" => 1024.0,
+        "m" | "mb" => 1e6,
+        "mib" => 1024.0 * 1024.0,
+        "g" | "gb" => 1e9,
+        "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" => 1e12,
+        "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    let bytes = n * scale;
+    if !bytes.is_finite() || bytes < 1.0 || bytes > u64::MAX as f64 {
+        return None;
+    }
+    Some(bytes as u64)
 }
 
 /// `redacted` is an M7 deliverable (§5.1). Accepting it silently would mean writing
@@ -276,95 +421,85 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Read the config file, then register the built-in `@audit` connection over it.
+    /// Read the config file's connections, then register the built-in `@audit`
+    /// connection over them.
     ///
     /// A missing config file is not an error: it yields a registry holding `@audit`
     /// alone, which is enough to inspect the log on a fresh install.
+    ///
+    /// Callers that also need the settings outside `[connections]` — the spool's limits
+    /// — read the file once with [`Config::load`] instead.
     pub fn load(config_path: Option<&Path>, audit_db: &Path) -> Result<Self, CoreError> {
-        let path = match config_path {
-            Some(p) => p.to_path_buf(),
-            None => default_config_path()?,
-        };
+        Ok(Config::load(config_path, audit_db)?.registry)
+    }
 
+    fn from_file(
+        path: &Path,
+        connections: BTreeMap<String, ConnectionFile>,
+    ) -> Result<Self, CoreError> {
         let mut registry = Registry::default();
 
-        if path.exists() {
-            let text = std::fs::read_to_string(&path).map_err(|e| CoreError::Config {
-                path: path.clone(),
-                detail: e.to_string(),
-            })?;
-            let file: ConfigFile = toml::from_str(&text).map_err(|e| CoreError::Config {
-                path: path.clone(),
-                detail: e.to_string(),
-            })?;
-            for (name, c) in file.connections {
-                if name.starts_with('@') {
-                    return Err(CoreError::Config {
-                        path: path.clone(),
-                        detail: format!(
-                            "connection {name:?}: names starting with '@' are reserved for \
-                             built-in connections"
-                        ),
-                    });
-                }
-                let bad = |detail: String| CoreError::Config {
-                    path: path.clone(),
-                    detail: format!("connection {name:?}: {detail}"),
-                };
-
-                let credential = match &c.credential {
-                    Some(text) => {
-                        CredentialRef::parse(text, &name).map_err(|e| bad(e.to_string()))?
-                    }
-                    None => CredentialRef::default_for(&name),
-                };
-                let catalog_ttl = match &c.catalog_ttl {
-                    Some(text) => parse_duration(text).ok_or_else(|| {
-                        bad(format!(
-                            "catalog_ttl {text:?} is not a duration; write it as \"60s\", \
-                             \"5m\", \"1h\", or \"0\" to cache nothing"
-                        ))
-                    })?,
-                    None => DEFAULT_CATALOG_TTL,
-                };
-                let connect_timeout = match &c.connect_timeout {
-                    Some(text) => parse_duration(text).ok_or_else(|| {
-                        bad(format!(
-                            "connect_timeout {text:?} is not a duration; write it as \"10s\" \
-                             or \"1m\""
-                        ))
-                    })?,
-                    None => DEFAULT_CONNECT_TIMEOUT,
-                };
-
-                let cfg = ConnectionConfig {
-                    name: name.clone(),
-                    driver: c.driver,
-                    path: c.path,
-                    host: c.host,
-                    port: c.port,
-                    user: c.user,
-                    credential,
-                    tls: c.tls,
-                    mode: c.mode,
-                    sql_logging: c.sql_logging,
-                    database: c.database,
-                    schema: c.schema,
-                    catalog_ttl,
-                    connect_timeout,
-                    builtin: false,
-                };
-                if let Err(detail) = check(&cfg) {
-                    return Err(bad(detail));
-                }
-
-                registry.connections.insert(name, cfg);
+        for (name, c) in connections {
+            if name.starts_with('@') {
+                return Err(CoreError::Config {
+                    path: path.to_path_buf(),
+                    detail: format!(
+                        "connection {name:?}: names starting with '@' are reserved for \
+                         built-in connections"
+                    ),
+                });
             }
-        }
+            let bad = |detail: String| CoreError::Config {
+                path: path.to_path_buf(),
+                detail: format!("connection {name:?}: {detail}"),
+            };
 
-        registry
-            .connections
-            .insert(AUDIT_CONNECTION.to_string(), audit_connection(audit_db));
+            let credential = match &c.credential {
+                Some(text) => CredentialRef::parse(text, &name).map_err(|e| bad(e.to_string()))?,
+                None => CredentialRef::default_for(&name),
+            };
+            let catalog_ttl = match &c.catalog_ttl {
+                Some(text) => parse_duration(text).ok_or_else(|| {
+                    bad(format!(
+                        "catalog_ttl {text:?} is not a duration; write it as \"60s\", \
+                         \"5m\", \"1h\", or \"0\" to cache nothing"
+                    ))
+                })?,
+                None => DEFAULT_CATALOG_TTL,
+            };
+            let connect_timeout = match &c.connect_timeout {
+                Some(text) => parse_duration(text).ok_or_else(|| {
+                    bad(format!(
+                        "connect_timeout {text:?} is not a duration; write it as \"10s\" \
+                         or \"1m\""
+                    ))
+                })?,
+                None => DEFAULT_CONNECT_TIMEOUT,
+            };
+
+            let cfg = ConnectionConfig {
+                name: name.clone(),
+                driver: c.driver,
+                path: c.path,
+                host: c.host,
+                port: c.port,
+                user: c.user,
+                credential,
+                tls: c.tls,
+                mode: c.mode,
+                sql_logging: c.sql_logging,
+                database: c.database,
+                schema: c.schema,
+                catalog_ttl,
+                connect_timeout,
+                builtin: false,
+            };
+            if let Err(detail) = check(&cfg) {
+                return Err(bad(detail));
+            }
+
+            registry.connections.insert(name, cfg);
+        }
 
         Ok(registry)
     }

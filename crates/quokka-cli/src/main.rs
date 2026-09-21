@@ -18,6 +18,7 @@ mod connections;
 mod credential;
 mod format;
 mod schema;
+mod spool;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,11 +27,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use quokka_core::{
-    execute, Actor, ActorKind, AuditLog, Client, Engine, ExecuteRequest, Registry, Status, Value,
-    AUDIT_CONNECTION, DEFAULT_MAX_ROWS,
+    Actor, ActorKind, AuditLog, Config, Engine, Value, AUDIT_CONNECTION, DEFAULT_MAX_ROWS,
 };
+use quokka_spool::SpoolSet;
+use uuid::Uuid;
 
-use crate::format::{sink_for, Format};
+use crate::format::Format;
+use crate::spool::{ExportTarget, QueryPlan};
 
 /// Exit codes, so a script can tell the failures apart (§6.1).
 pub mod exit {
@@ -45,6 +48,13 @@ pub mod exit {
     /// The audit log could not be written. Either the query was refused before it ran
     /// (invariant 6) or it ran and its outcome went unrecorded.
     pub const AUDIT_FAILED: u8 = 4;
+    /// The query ran and was logged; writing its export did not work.
+    ///
+    /// Its own code because neither of the neighbouring ones is true: a full disk is
+    /// not the caller's usage error, and the query really did run. A script that sees
+    /// this should retry the file, not re-examine its arguments — and the rows are in
+    /// the log either way.
+    pub const EXPORT_FAILED: u8 = 5;
 }
 
 #[derive(Debug, Parser)]
@@ -99,6 +109,8 @@ impl From<ActorKindArg> for ActorKind {
 enum Command {
     /// Run SQL against a connection.
     Query(QueryArgs),
+    /// Write an earlier query's rows to a file. Needs --rerun, and says why.
+    Export(ExportArgs),
     /// Show the configured connections.
     #[command(subcommand)]
     Connections(ConnectionsCommand),
@@ -203,10 +215,42 @@ struct QueryArgs {
     #[arg(long, value_enum, default_value = "table")]
     format: Format,
 
-    /// Stop after this many rows and say so. 512 is the UI's hard ceiling; a shell
-    /// pipeline is not a context window, so here it may be raised.
-    #[arg(long, value_name = "N", default_value_t = DEFAULT_MAX_ROWS)]
-    max_rows: u64,
+    /// Stop after this many rows and say so, and show that many on stdout.
+    ///
+    /// Defaults to 512 — the UI's hard ceiling, which a shell pipeline may raise — or,
+    /// when --export is given, to the spool's own row cap, because a file is not a
+    /// screen (§4.2). stdout still shows 512.
+    #[arg(long, value_name = "N")]
+    max_rows: Option<u64>,
+
+    /// Also write the whole result to a file, in this one invocation (§4.1). `-` is
+    /// stdout. The format comes from the extension unless --export-format says.
+    ///
+    /// Exports are audited events in their own right, linked to this query by
+    /// parent_id (§5).
+    #[arg(long, value_name = "PATH")]
+    export: Option<String>,
+
+    /// What to write the export as: csv, tsv, json, ndjson or parquet.
+    #[arg(long, value_name = "FORMAT")]
+    export_format: Option<String>,
+
+    /// Stream the result straight to the export file, with no spool and no cap (§4.2).
+    ///
+    /// For a dataset larger than local disk. Nothing is cached, so the rows cannot
+    /// afterwards be paged, sorted or re-exported without running the query again — and
+    /// parquet, which declares a type per column before the rows are seen, is not
+    /// available this way.
+    #[arg(long, requires = "export")]
+    all: bool,
+
+    /// Sort the result by a column, reading the spool rather than re-running anything.
+    /// `--sort total:desc`. Repeat for more keys.
+    ///
+    /// When the result was truncated this sorts the *spooled* rows and says so: the top
+    /// of the first million is not the top of twelve million (§4.2).
+    #[arg(long = "sort", value_name = "COLUMN[:desc]")]
+    sort: Vec<String>,
 
     /// Bind a value, in order. `[type:]value`, where type is one of `text`, `int`,
     /// `float`, `bool`, `blob` (hex) or `null`; anything else is text.
@@ -216,6 +260,41 @@ struct QueryArgs {
     /// only how many there were.
     #[arg(long = "param", value_name = "[TYPE:]VALUE")]
     params: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// The query to export, as `quokka query` reported its id.
+    #[arg(long, value_name = "ID")]
+    query_id: Uuid,
+
+    /// Run the query again. Required, because the spool died with the invocation that
+    /// made it and the rows can only come back by paying for a second scan (§1.4).
+    #[arg(long)]
+    rerun: bool,
+
+    /// Where to write it. `-` is stdout.
+    #[arg(short = 'o', long, value_name = "PATH")]
+    output: String,
+
+    /// What to write it as: csv, tsv, json, ndjson or parquet. Inferred from the file
+    /// name when it can be.
+    #[arg(long, value_name = "FORMAT")]
+    export_format: Option<String>,
+
+    /// Stream straight to the file with no spool (§4.2).
+    #[arg(long)]
+    all: bool,
+
+    #[arg(long, value_name = "N")]
+    max_rows: Option<u64>,
+
+    #[arg(long = "sort", value_name = "COLUMN[:desc]")]
+    sort: Vec<String>,
+
+    /// How to print the summary of what was written.
+    #[arg(long, value_enum, default_value = "table")]
+    format: Format,
 }
 
 /// Parse one `--param`.
@@ -340,6 +419,7 @@ async fn main() -> ExitCode {
 fn error_format(cli: &Cli) -> Format {
     match &cli.command {
         Command::Query(a) => a.format,
+        Command::Export(a) => a.format,
         Command::Connections(ConnectionsCommand::List(a)) => a.format,
         Command::Schema(SchemaCommand::Describe(a)) => a.format,
         Command::Credential(CredentialCommand::Status(a)) => a.format,
@@ -363,9 +443,10 @@ async fn run(cli: Cli) -> Result<u8> {
         .await
         .with_context(|| format!("opening the audit log at {}", audit_path.display()))?;
 
-    let registry = Registry::load(cli.config.as_deref(), &audit_path)?;
+    let config = Config::load(cli.config.as_deref(), &audit_path)?;
+    let spool_limits = quokka_spool::Limits::from(config.spool);
     let engine = Arc::new(Engine::new(
-        registry,
+        config.registry,
         audit,
         quokka_driver::builtin_factories(),
     ));
@@ -373,6 +454,12 @@ async fn run(cli: Cli) -> Result<u8> {
     watch_for_interrupt(engine.clone());
 
     let actor = resolve_actor(cli.actor.clone(), cli.actor_kind);
+
+    // The spool directory is claimed — and orphans swept (§4.1) — only for the
+    // subcommands that will actually spool something. `connections list` reaching a
+    // database is not a thing that happens, and neither is it leaving a directory
+    // behind in the cache.
+    let mut spools: Option<SpoolSet> = None;
 
     let code = match cli.command {
         Command::Query(args) => {
@@ -382,13 +469,53 @@ async fn run(cli: Cli) -> Result<u8> {
                 .iter()
                 .map(|p| parse_param(p))
                 .collect::<Result<Vec<_>>>()?;
-            run_query(
+            let export = match &args.export {
+                Some(path) => Some(ExportTarget::resolve(
+                    path,
+                    args.export_format.as_deref(),
+                    args.all,
+                )?),
+                None => None,
+            };
+            let set = spools.insert(SpoolSet::open(None, spool_limits).await.context(
+                "preparing the result spool; set $QUOKKA_CACHE_DIR to choose where \
+                 spools live",
+            )?);
+            spool::query(
                 &engine,
-                &args.connection,
-                &sql,
-                params,
-                args.format,
-                args.max_rows,
+                set,
+                QueryPlan {
+                    connection: args.connection,
+                    sql,
+                    params,
+                    format: args.format,
+                    max_rows: args.max_rows,
+                    export,
+                    sort: args.sort,
+                    parent_id: None,
+                },
+                actor,
+            )
+            .await?
+        }
+        Command::Export(args) => {
+            let target =
+                ExportTarget::resolve(&args.output, args.export_format.as_deref(), args.all)?;
+            let set = spools.insert(SpoolSet::open(None, spool_limits).await.context(
+                "preparing the result spool; set $QUOKKA_CACHE_DIR to choose where \
+                 spools live",
+            )?);
+            spool::export_by_id(
+                &engine,
+                set,
+                spool::ExportById {
+                    query_id: args.query_id,
+                    rerun: args.rerun,
+                    target,
+                    max_rows: args.max_rows,
+                    sort: args.sort,
+                    format: args.format,
+                },
                 actor,
             )
             .await?
@@ -421,27 +548,44 @@ async fn run(cli: Cli) -> Result<u8> {
         Command::Credential(CredentialCommand::Status(args)) => {
             credential::status(&engine, args.connection.as_deref(), args.format)?
         }
+        // The audit subcommands spool like every other query: they are queries against
+        // `@audit`, and nothing about reading the log makes them a different kind of
+        // thing (§5).
         Command::Audit(AuditCommand::Query(args)) => {
-            run_query(
+            let set = spools.insert(SpoolSet::open(None, spool_limits).await?);
+            spool::query(
                 &engine,
-                AUDIT_CONNECTION,
-                &args.sql,
-                Vec::new(),
-                args.format,
-                args.max_rows,
+                set,
+                QueryPlan {
+                    connection: AUDIT_CONNECTION.to_string(),
+                    sql: args.sql,
+                    params: Vec::new(),
+                    format: args.format,
+                    max_rows: Some(args.max_rows),
+                    export: None,
+                    sort: Vec::new(),
+                    parent_id: None,
+                },
                 actor,
             )
             .await?
         }
         Command::Audit(AuditCommand::Tail(args)) => {
             let sql = tail_sql(&args);
-            run_query(
+            let set = spools.insert(SpoolSet::open(None, spool_limits).await?);
+            spool::query(
                 &engine,
-                AUDIT_CONNECTION,
-                &sql,
-                Vec::new(),
-                args.format,
-                args.limit,
+                set,
+                QueryPlan {
+                    connection: AUDIT_CONNECTION.to_string(),
+                    sql,
+                    params: Vec::new(),
+                    format: args.format,
+                    max_rows: Some(args.limit),
+                    export: None,
+                    sort: Vec::new(),
+                    parent_id: None,
+                },
                 actor,
             )
             .await?
@@ -449,6 +593,11 @@ async fn run(cli: Cli) -> Result<u8> {
         Command::Audit(AuditCommand::Verify(args)) => verify(&engine, args.format).await?,
     };
 
+    // The clean exit of §4.1: the spool directory goes, so nothing of this result
+    // survives the process that made it.
+    if let Some(set) = spools {
+        set.close().await;
+    }
     engine.audit().close().await;
     Ok(code)
 }
@@ -465,30 +614,6 @@ fn watch_for_interrupt(engine: Arc<Engine>) {
             engine.cancel_all().await;
         }
     });
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_query(
-    engine: &Engine,
-    connection: &str,
-    sql: &str,
-    params: Vec<Value>,
-    format: Format,
-    max_rows: u64,
-    actor: Actor,
-) -> Result<u8> {
-    let mut sink = sink_for(format);
-    let mut request = ExecuteRequest::new(connection, sql, actor);
-    request.client = Client::Cli;
-    request.max_rows = max_rows;
-    request.params = params;
-
-    let outcome = execute(engine, request, sink.as_mut()).await?;
-
-    Ok(match outcome.status {
-        Status::Ok => exit::OK,
-        _ => exit::QUERY_FAILED,
-    })
 }
 
 /// Verification reads the log's own rows rather than going through `execute()`.
@@ -617,6 +742,11 @@ fn os_user() -> String {
 }
 
 fn classify(e: &anyhow::Error) -> u8 {
+    // Checked before the core errors, because an export failure is the more specific
+    // claim: the query it names ran, and only the file did not.
+    if e.downcast_ref::<spool::ExportFailed>().is_some() {
+        return exit::EXPORT_FAILED;
+    }
     match e.downcast_ref::<quokka_core::CoreError>() {
         Some(quokka_core::CoreError::AuditWriteFailed { .. })
         | Some(quokka_core::CoreError::AuditFinishFailed { .. })

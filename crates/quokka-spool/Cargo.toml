@@ -1,0 +1,62 @@
+[package]
+name = "quokka-spool"
+description = "QuokkaQuery's result spool: one execution, then paging, sorting and streamed export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# Parquet is default-on and separable, which is a deliberate pair of choices.
+#
+# Default-on because ARCHITECTURE §4 lists Parquet beside CSV as a first-class export
+# format, and a build whose headline export format is missing is a surprise, not a lean
+# build. Separable because `arrow`/`parquet` is ~60 crates and the largest single thing
+# this workspace compiles — a library consumer that only needs CSV should be able to
+# say so.
+#
+# What it does *not* cost: `parquet`, the arrow crates and thrift are Apache-2.0, and
+# the codec we enable (`snap`) is BSD-3-Clause. Nothing here is GPL (CLAUDE.md) and
+# nothing here is a `-sys` crate, so §8's build-dependency list is unchanged: the C
+# compiler `sqlx-sqlite` already needs is still the only one. The compression features
+# that *would* pull C — `zstd`, `lz4` — stay off, which is why `default-features` is
+# false below.
+#
+# Note where the CLI stands on this: `quokkaquery` asks for this feature by name rather
+# than inheriting it, so `cargo install quokkaquery --no-default-features` still exports
+# Parquet. That flag exists to drop the GUI stack for a container or an agent's box
+# (CLAUDE.md), and a container is exactly where writing Parquet is most useful.
+default = ["parquet"]
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
+
+[dependencies]
+quokka-core.workspace = true
+
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true }
+thiserror.workspace = true
+time.workspace = true
+tokio = { workspace = true }
+uuid.workspace = true
+directories.workspace = true
+
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+
+[dev-dependencies]
+quokka-audit.workspace = true
+# The round-trip test reads a Parquet file back, which means the reader as well as the
+# writer. Declared here too because an optional dependency of the library is not
+# reachable from an integration test.
+arrow-array.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
+quokka-driver = { workspace = true, features = ["sqlite"] }
+async-trait.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
