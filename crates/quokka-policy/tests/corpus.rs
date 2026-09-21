@@ -540,7 +540,10 @@ fn a_read_only_connection_admits_only_certain_reads() {
         let s = summarize(c.sql, c.dialect);
         assert_eq!(
             policy.decide(&s),
-            Outcome::Allow { writes: false },
+            Outcome::Allow {
+                writes: false,
+                warning: None
+            },
             "a read was denied: {:?} ({})",
             c.sql,
             c.dialect
@@ -570,6 +573,7 @@ fn a_write_needs_the_mode_and_the_opt_in() {
         write_requested: true,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
     assert!(
         matches!(
@@ -585,6 +589,7 @@ fn a_write_needs_the_mode_and_the_opt_in() {
         write_requested: false,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
     assert!(
         matches!(
@@ -600,8 +605,15 @@ fn a_write_needs_the_mode_and_the_opt_in() {
         write_requested: true,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
-    assert_eq!(both.decide(&s), Outcome::Allow { writes: true });
+    assert_eq!(
+        both.decide(&s),
+        Outcome::Allow {
+            writes: true,
+            warning: None
+        }
+    );
 }
 
 /// The parse-failure decision, asserted in both directions so that a later change
@@ -626,10 +638,14 @@ fn unreadable_text_is_a_write() {
         write_requested: true,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
     assert_eq!(
         authorized.decide(&s),
-        Outcome::Allow { writes: true },
+        Outcome::Allow {
+            writes: true,
+            warning: None
+        },
         "a human who already authorized writes here is not second-guessed"
     );
 }
@@ -648,6 +664,7 @@ fn a_surface_can_be_stricter_than_the_connection_and_says_so() {
         write_requested: true,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
     let denial = narrowed.decide(&s).denial().cloned().expect("denied");
     assert!(matches!(
@@ -671,6 +688,7 @@ fn a_surface_can_be_stricter_than_the_connection_and_says_so() {
         write_requested: true,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
     let denial = widened.decide(&s).denial().cloned().expect("denied");
     assert!(matches!(
@@ -694,6 +712,7 @@ fn stacked_statements_are_refused_even_with_every_key_turned() {
         write_requested: true,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
     let s = summarize("SELECT 1; DROP TABLE t", Dialect::Sqlite);
     assert!(matches!(
@@ -727,6 +746,7 @@ mod allowlist {
             write_requested: false,
             allow,
             default_schema: schema,
+            cost: None,
         }
     }
 
@@ -736,7 +756,10 @@ mod allowlist {
         let s = summarize("SELECT * FROM anything", Dialect::Postgres);
         assert_eq!(
             policy(&allow, None).decide(&s),
-            Outcome::Allow { writes: false }
+            Outcome::Allow {
+                writes: false,
+                warning: None
+            }
         );
     }
 
@@ -746,7 +769,13 @@ mod allowlist {
         let p = policy(&allow, None);
 
         let ok = summarize("SELECT * FROM public.orders", Dialect::Postgres);
-        assert_eq!(p.decide(&ok), Outcome::Allow { writes: false });
+        assert_eq!(
+            p.decide(&ok),
+            Outcome::Allow {
+                writes: false,
+                warning: None
+            }
+        );
 
         let not_ok = summarize("SELECT * FROM public.customers", Dialect::Postgres);
         assert!(matches!(
@@ -779,7 +808,10 @@ mod allowlist {
         );
         assert_eq!(
             policy(&allow, None).decide(&s),
-            Outcome::Allow { writes: false }
+            Outcome::Allow {
+                writes: false,
+                warning: None
+            }
         );
     }
 
@@ -789,7 +821,13 @@ mod allowlist {
         let p = policy(&allow, None);
 
         let ok = summarize("SELECT * FROM analytics.daily", Dialect::Postgres);
-        assert_eq!(p.decide(&ok), Outcome::Allow { writes: false });
+        assert_eq!(
+            p.decide(&ok),
+            Outcome::Allow {
+                writes: false,
+                warning: None
+            }
+        );
 
         let not_ok = summarize("SELECT * FROM secrets.daily", Dialect::Postgres);
         assert!(matches!(
@@ -812,7 +850,10 @@ mod allowlist {
         ));
         assert_eq!(
             policy(&allow, Some("analytics")).decide(&s),
-            Outcome::Allow { writes: false }
+            Outcome::Allow {
+                writes: false,
+                warning: None
+            }
         );
     }
 
@@ -822,7 +863,10 @@ mod allowlist {
         let s = summarize("SELECT * FROM public.ORDERS", Dialect::Postgres);
         assert_eq!(
             policy(&allow, None).decide(&s),
-            Outcome::Allow { writes: false }
+            Outcome::Allow {
+                writes: false,
+                warning: None
+            }
         );
     }
 
@@ -837,6 +881,7 @@ mod allowlist {
             write_requested: true,
             allow: &allow,
             default_schema: None,
+            cost: None,
         };
 
         for sql in [
@@ -875,6 +920,7 @@ fn an_update_or_delete_with_no_where_clause_is_flagged_without_being_refused() {
         write_requested: true,
         allow: &allow,
         default_schema: None,
+        cost: None,
     };
 
     for (sql, expected) in [
@@ -934,5 +980,211 @@ fn no_fingerprint_in_the_corpus_carries_a_literal() {
                 c.sql
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The cumulative cost budget (§6.4, layer 2)
+// ---------------------------------------------------------------------------
+
+/// Table-driven like the rest of the corpus, because the interesting part of a budget is
+/// the boundary: at the limit, one byte under it, one byte over, and the three ways a
+/// budget can be absent.
+mod cost_guard {
+    use super::*;
+    use quokka_policy::{ActorClass, CostContext, CostGuard};
+    use std::time::Duration;
+
+    const GB: u64 = 1_000_000_000;
+
+    fn guard() -> CostGuard {
+        CostGuard {
+            window: Duration::from_secs(86_400),
+            agent_limit: Some(50 * GB),
+            human_limit: None,
+            human_warn: Some(500 * GB),
+        }
+    }
+
+    fn decide(actor: ActorClass, spend: Option<u64>) -> Outcome {
+        let allow = Allowlist::none();
+        let policy = Policy {
+            mode: AccessMode::ReadOnly,
+            surface_mode: AccessMode::ReadWrite,
+            write_requested: false,
+            allow: &allow,
+            default_schema: None,
+            cost: Some(CostContext {
+                guard: guard(),
+                actor,
+                spend,
+            }),
+        };
+        policy.decide(&summarize("SELECT * FROM events", Dialect::Athena))
+    }
+
+    /// **The asymmetry §6.4 exists for**, asserted rather than assumed: one config, two
+    /// callers, two answers. A person running an expensive query is awake and watching;
+    /// an agent looping at 3am is the invoice.
+    #[test]
+    fn agents_and_humans_are_capped_separately_under_one_config() {
+        let spent = Some(60 * GB);
+
+        let agent = decide(ActorClass::Agent, spent);
+        assert_eq!(
+            agent.denial().map(|d| d.code()),
+            Some("policy.cost_budget"),
+            "an agent past 50GB is refused: {agent:?}"
+        );
+
+        let human = decide(ActorClass::Human, spent);
+        assert!(
+            matches!(human, Outcome::Allow { .. }),
+            "the same spend by a human on the same connection runs: {human:?}"
+        );
+        assert!(
+            matches!(human, Outcome::Allow { warning: None, .. }),
+            "and is not even warned, at a tenth of the warning threshold: {human:?}"
+        );
+    }
+
+    #[test]
+    fn the_boundary_is_at_the_limit_not_past_it() {
+        assert!(
+            matches!(
+                decide(ActorClass::Agent, Some(50 * GB - 1)),
+                Outcome::Allow { .. }
+            ),
+            "one byte under the budget still runs"
+        );
+        assert_eq!(
+            decide(ActorClass::Agent, Some(50 * GB))
+                .denial()
+                .map(|d| d.code()),
+            Some("policy.cost_budget"),
+            "at the budget, the next query is the one that is refused — the budget \
+             stops the query after the one that crossed the line (§6.4)"
+        );
+    }
+
+    /// The message has to name the budget, the window and the spend, or it is not
+    /// actionable — and it has to be honest about what it did not do.
+    #[test]
+    fn a_refusal_names_the_budget_the_window_and_what_was_spent() {
+        let outcome = decide(ActorClass::Agent, Some(62 * GB));
+        let denial = outcome.denial().expect("a denial");
+        let message = denial.explain("lake");
+
+        assert!(message.contains("50 GB"), "the budget: {message}");
+        assert!(message.contains("1d"), "the window: {message}");
+        assert!(message.contains("62 GB"), "the spend: {message}");
+        assert!(message.contains("lake"), "the connection: {message}");
+        assert!(
+            message.contains("cost_guard"),
+            "where to change it, since only a human can: {message}"
+        );
+        assert!(
+            message.contains("BytesScannedCutoffPerQuery"),
+            "the message must say which layer can actually stop a running query: {message}"
+        );
+        assert!(
+            message.contains("after the one that crossed the line"),
+            "promising a pre-execution cap would be a lie: {message}"
+        );
+    }
+
+    /// A human past `human_warn` runs and is told. The warning is a sentence, not a
+    /// behaviour.
+    #[test]
+    fn a_human_past_the_warning_threshold_is_warned_and_runs() {
+        let outcome = decide(ActorClass::Human, Some(501 * GB));
+        let Outcome::Allow { warning, .. } = outcome else {
+            panic!("an uncapped human is never refused: {outcome:?}");
+        };
+        let warning = warning.expect("past human_warn, there should be a warning");
+        let message = warning.message("lake");
+        assert!(message.contains("501 GB"), "{message}");
+        assert!(message.contains("500 GB"), "{message}");
+        assert!(message.contains("no limit"), "{message}");
+    }
+
+    /// **Judgement call, written down.** A spend that could not be read is not a spend of
+    /// zero. Invariant 6 fails closed when the log cannot be *written*; this is the other
+    /// half, and it needs stating either way rather than falling out of a `?`.
+    #[test]
+    fn a_spend_that_cannot_be_read_fails_closed() {
+        let outcome = decide(ActorClass::Agent, None);
+        let denial = outcome.denial().expect("an unknown spend is a refusal");
+        assert_eq!(denial.code(), "policy.cost_unknown");
+
+        let message = denial.explain("lake");
+        assert!(
+            message.contains("fails closed"),
+            "the refusal should say it is a decision: {message}"
+        );
+        assert!(
+            message.contains("cost_guard"),
+            "and how to stop having a budget, if that is what you want: {message}"
+        );
+
+        // It binds a human exactly as it binds an agent: not knowing is not knowing.
+        assert_eq!(
+            decide(ActorClass::Human, None).denial().map(|d| d.code()),
+            Some("policy.cost_unknown")
+        );
+    }
+
+    /// A connection with no budget reads nothing and refuses nothing — which is every
+    /// connection by default.
+    #[test]
+    fn no_budget_means_no_check_at_all() {
+        let allow = Allowlist::none();
+        let policy = Policy {
+            mode: AccessMode::ReadOnly,
+            surface_mode: AccessMode::ReadWrite,
+            write_requested: false,
+            allow: &allow,
+            default_schema: None,
+            cost: None,
+        };
+        let outcome = policy.decide(&summarize("SELECT 1", Dialect::Athena));
+        assert!(matches!(outcome, Outcome::Allow { warning: None, .. }));
+    }
+
+    /// The order of the checks: a statement that is refused for what it *is* must be
+    /// reported that way, not as an overspend. A caller told "you are over budget" goes
+    /// and looks at the budget, and the budget is not what is wrong.
+    #[test]
+    fn a_statement_refused_for_what_it_is_is_not_reported_as_an_overspend() {
+        let allow = Allowlist::none();
+        let policy = Policy {
+            mode: AccessMode::ReadOnly,
+            surface_mode: AccessMode::ReadWrite,
+            write_requested: false,
+            allow: &allow,
+            default_schema: None,
+            cost: Some(CostContext {
+                guard: guard(),
+                actor: ActorClass::Agent,
+                spend: Some(900 * GB),
+            }),
+        };
+
+        let write = policy.decide(&summarize("DELETE FROM events", Dialect::Athena));
+        assert_eq!(write.denial().map(|d| d.code()), Some("policy.read_only"));
+
+        let stacked = policy.decide(&summarize("SELECT 1; SELECT 2", Dialect::Athena));
+        assert_eq!(
+            stacked.denial().map(|d| d.code()),
+            Some("policy.multiple_statements")
+        );
+    }
+
+    /// An unlimited actor is never refused, however much it has spent — `"unlimited"` in
+    /// the config file means what it says.
+    #[test]
+    fn an_unlimited_actor_is_never_refused() {
+        let outcome = decide(ActorClass::Human, Some(9_000 * GB));
+        assert!(matches!(outcome, Outcome::Allow { .. }), "{outcome:?}");
     }
 }

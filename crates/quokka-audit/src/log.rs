@@ -189,6 +189,55 @@ impl AuditLog {
         rows.iter().map(stored_from_row).collect()
     }
 
+    /// Bytes this actor has scanned on one connection since `since` (§6.4).
+    ///
+    /// **Why this is a method here rather than a query through `execute()`.** §6.4 says
+    /// "a budget check is a query against `@audit`", and that is true of where the
+    /// number lives. Routing the check through the one execute path is a different
+    /// claim, and it does not survive contact with §5: `@audit` is an ordinary
+    /// connection, so a query against it appends `query_started` and `query_finished` —
+    /// and *that* query would then need a budget check of its own, which appends two
+    /// more. Even bounded, a log that fills with its own bookkeeping is a log nobody
+    /// reads, and the events would be indistinguishable from queries a person ran.
+    ///
+    /// The standing this takes instead is the one `quokka export --query-id` already
+    /// claimed and `quokka audit verify` has always had: **this program consulting its
+    /// own record.** It is a structured lookup with no caller-supplied SQL — one
+    /// aggregate over fixed columns, with every value bound — rather than SQL somebody
+    /// asked to run. Invariant 1 is about reaching *a database* on a caller's behalf;
+    /// `quokka-audit` reading the file it owns and writes is not that, which is why
+    /// `verify()` above needs no permit either. A query a person writes against the log
+    /// still goes through `@audit` and is logged like any other.
+    ///
+    /// Counts `query_finished` rows only, since that is where the column is filled, and
+    /// filters by `actor_id` *and* `actor_kind` so that a human and an agent sharing a
+    /// name do not pool their spending.
+    pub async fn data_scanned_since(
+        &self,
+        connection: &str,
+        actor_id: &str,
+        actor_kind: ActorKind,
+        since: &str,
+    ) -> Result<u64, AuditError> {
+        // NULL and 0 are different things everywhere else in this file; here they are
+        // the same, because a driver that reports no bytes scanned has scanned none
+        // that we know of and cannot be charged for what it did not report.
+        let total: Option<i64> = sqlx::query_scalar(
+            "SELECT sum(data_scanned_bytes) FROM audit_log \
+             WHERE event_kind = 'query_finished' \
+               AND connection = ? AND actor_id = ? AND actor_kind = ? \
+               AND at >= ?",
+        )
+        .bind(connection)
+        .bind(actor_id)
+        .bind(actor_kind.as_str())
+        .bind(since)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(total.unwrap_or(0).max(0) as u64)
+    }
+
     /// Recompute the chain and compare it with what is stored.
     ///
     /// Detects any edited row (its own hash no longer matches its contents), any excised
